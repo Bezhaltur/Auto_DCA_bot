@@ -20,12 +20,12 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
+# Virtual Environment
 venv/
 ENV/
 env/
 
-# IDE
+# IDEs
 .vscode/
 .idea/
 *.swp
@@ -34,20 +34,15 @@ env/
 
 # Environment variables
 .env
-.env.local
 
 # Database
 *.db
 *.sqlite
 *.sqlite3
 
-# Logs
-logs/
-*.log
-
 # OS
 .DS_Store
 Thumbs.db
 
-# Test files
-test_*.db
+# Logs
+*.log
