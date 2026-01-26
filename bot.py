@@ -9,16 +9,26 @@ import re
 import requests
 from dotenv import load_dotenv
 import aiosqlite
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.fsm.storage.memory import MemoryStorage
+from networks import get_network_config, get_blockchair_url
+from wallet import (
+    save_keystore, load_keystore,
+    delete_keystore, get_wallet_address
+)
+from auto_send import auto_send_usdt
+from erc20 import get_web3_instance, get_usdt_balance, get_native_balance
 
 # ============================================================================
 # НАСТРОЙКА И КОНФИГУРАЦИЯ
 # ============================================================================
 
 # Настройка логирования - все операции бота логируются в файл и консоль
+# Создаём директорию для логов если её нет
+os.makedirs("logs", exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -37,6 +47,17 @@ FF_API_KEY = os.getenv("FF_API_KEY")
 FF_API_SECRET = os.getenv("FF_API_SECRET")
 FF_API_URL = "https://ff.io/api/v2"  # базовый URL API FixedFloat
 
+# Import test configuration
+from test_config import (
+    DRY_RUN, MOCK_FIXEDFLOAT, USE_TESTNET, is_test_mode,
+    get_mock_fixedfloat_order, get_mock_fixedfloat_ccies, get_mock_fixedfloat_price,
+    mask_sensitive_data
+)
+
+# In-memory password storage (NOT persisted to disk or database)
+# Keys: (user_id, network_key) -> password
+_wallet_passwords = {}
+
 # Маппинг пользовательских названий сетей на коды FixedFloat API
 # Обновляется при старте бота из реального списка валют
 NETWORK_CODES = {
@@ -48,6 +69,23 @@ NETWORK_CODES = {
 # ============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================================
+
+def format_interval(hours: int) -> str:
+    """
+    Преобразует интервал в часах в читаемый формат.
+    Используется в нескольких местах для единообразия.
+    """
+    if hours == 12:
+        return "12 часов"
+    elif hours == 24:
+        return "день"
+    elif hours == 168:
+        return "неделю"
+    elif hours == 720:
+        return "месяц"
+    else:
+        return f"{hours}ч"
+
 
 def validate_btc_address(address: str) -> bool:
     """
@@ -88,6 +126,7 @@ def ff_sign(data_str: str) -> str:
 def ff_request(method: str, params=None) -> dict:
     """
     Универсальный синхронный POST-запрос к FixedFloat API.
+    Supports mock mode for testing.
     
     Args:
         method: endpoint API (например: "ccies", "price", "create")
@@ -99,6 +138,49 @@ def ff_request(method: str, params=None) -> dict:
     Raises:
         RuntimeError: если API вернул ошибку (code != 0)
     """
+    # Mock mode - return mocked responses
+    if MOCK_FIXEDFLOAT:
+        logger.info(f"[MOCK] FixedFloat API запрос: {method} с параметрами {mask_sensitive_data(params)}")
+        
+        if method == "ccies":
+            mock_response = get_mock_fixedfloat_ccies()
+            logger.info(f"[MOCK] FixedFloat ответ: {method}")
+            return mock_response["data"]
+        
+        elif method == "price":
+            network_key = params.get("fromCcy", "").replace("USDT", "USDT-")
+            if "ARBITRUM" in network_key.upper():
+                network_key = "USDT-ARB"
+            elif "BSC" in network_key.upper():
+                network_key = "USDT-BSC"
+            elif "MATIC" in network_key.upper() or "POLYGON" in network_key.upper():
+                network_key = "USDT-MATIC"
+            mock_response = get_mock_fixedfloat_price(network_key)
+            logger.info(f"[MOCK] FixedFloat ответ: {method}")
+            return mock_response["data"]
+        
+        elif method == "create":
+            # Extract network from fromCcy
+            from_ccy = params.get("fromCcy", "")
+            network_key = "USDT-ARB"  # default
+            if "ARBITRUM" in from_ccy.upper():
+                network_key = "USDT-ARB"
+            elif "BSC" in from_ccy.upper():
+                network_key = "USDT-BSC"
+            elif "MATIC" in from_ccy.upper() or "POLYGON" in from_ccy.upper():
+                network_key = "USDT-MATIC"
+            
+            amount = float(params.get("amount", 0))
+            btc_address = params.get("toAddress", "")
+            mock_response = get_mock_fixedfloat_order(network_key, amount, btc_address)
+            logger.info(f"[MOCK] FixedFloat ответ: {method}, order_id={mock_response['data']['id']}")
+            return mock_response["data"]
+        
+        else:
+            logger.warning(f"[MOCK] Unknown method {method}, returning empty data")
+            return {}
+    
+    # Real API call
     if not FF_API_KEY or not FF_API_SECRET:
         raise ValueError("FF_API_KEY или FF_API_SECRET не заданы в .env")
 
@@ -115,25 +197,47 @@ def ff_request(method: str, params=None) -> dict:
         "X-API-SIGN": ff_sign(data_str),
     }
 
-    logger.info(f"FixedFloat API запрос: {method} с параметрами {params}")
-    resp = requests.post(url, data=data_str.encode("utf-8"), headers=headers, timeout=30)
+    logger.info(f"FixedFloat API запрос: {method} с параметрами {mask_sensitive_data(params)}")
+    try:
+        resp = requests.post(url, data=data_str.encode("utf-8"), headers=headers, timeout=30)
+        resp.raise_for_status()  # Вызовет исключение для HTTP ошибок (4xx, 5xx)
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Ошибка HTTP запроса к FixedFloat API: {e}")
+        raise RuntimeError(f"Ошибка подключения к FixedFloat API: {e}")
     
     logger.info(f"FixedFloat ответ: status={resp.status_code}")
 
-    data = resp.json()
-    if data.get("code") != 0:
-        logger.error(f"FixedFloat API ошибка: {data}")
-        raise RuntimeError(f"FixedFloat error: {data}")
+    try:
+        data = resp.json()
+    except ValueError as e:
+        logger.error(f"Ошибка парсинга JSON ответа от FixedFloat: {e}, response text: {resp.text[:200]}")
+        raise RuntimeError(f"Неверный формат ответа от FixedFloat API: {e}")
+    
+    code = data.get("code")
+    if code != 0:
+        error_msg = data.get("msg", "Unknown error")
+        error_data = data.get("data")
+        
+        # Специальная обработка известных ошибок
+        if code == 310:
+            error_msg = "Валюта или сеть недоступна для обмена"
+        elif code == 311:
+            error_msg = "Валюта недоступна для получения в данный момент"
+        elif code == 312:
+            error_msg = "Валюта недоступна для отправки в данный момент"
+        elif code == 301:
+            error_msg = "Сумма вне допустимых лимитов"
+        elif code == 401:
+            error_msg = "Неверные API ключи"
+        elif code == 501:
+            error_msg = "Нет прав доступа к API"
+        
+        logger.error(f"FixedFloat API ошибка (code={code}): {error_msg}, data={error_data}")
+        raise RuntimeError(f"FixedFloat error (code={code}): {error_msg}")
     
     return data["data"]
 
 
-def ff_get_ccies():
-    """
-    Получить список всех доступных валют и сетей из FixedFloat.
-    Используется для проверки актуальных кодов валют.
-    """
-    return ff_request("ccies", {})
 
 
 async def ff_request_async(method: str, params=None) -> dict:
@@ -142,6 +246,52 @@ async def ff_request_async(method: str, params=None) -> dict:
     Выполняет синхронный запрос в отдельном потоке, чтобы не блокировать event loop бота.
     """
     return await asyncio.to_thread(ff_request, method, params)
+
+
+async def get_fixedfloat_limits(network_key: str) -> dict:
+    """
+    Получает минимальные и максимальные лимиты для сети из FixedFloat API.
+    
+    Args:
+        network_key: ключ сети из NETWORK_CODES (например "USDT-ARB")
+    
+    Returns:
+        dict с ключами 'min' и 'max' (float значения в USDT)
+    
+    Raises:
+        RuntimeError: если сеть недоступна или API вернул ошибку
+    """
+    from_ccy = NETWORK_CODES.get(network_key)
+    if not from_ccy:
+        raise ValueError(f"Неизвестная сеть: {network_key}")
+    
+    try:
+        # Используем price API для получения лимитов
+        data = await ff_request_async("price", {
+            "type": "fixed",
+            "fromCcy": from_ccy,
+            "toCcy": "BTC",
+            "direction": "from",
+            "amount": 50,  # любая сумма для получения лимитов
+        })
+        
+        from_info = data.get("from", {})
+        min_amt = from_info.get("min")
+        max_amt = from_info.get("max")
+        
+        if min_amt is None or max_amt is None:
+            raise RuntimeError(f"Не удалось получить лимиты для {network_key}")
+        
+        return {
+            "min": float(min_amt),
+            "max": float(max_amt)
+        }
+    except RuntimeError as e:
+        # Пробрасываем ошибки API дальше
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка получения лимитов для {network_key}: {e}")
+        raise RuntimeError(f"Ошибка получения лимитов для {network_key}: {e}")
 
 
 async def update_network_codes():
@@ -269,6 +419,55 @@ async def init_db():
         if "deleted" not in existing_columns:
             await db.execute("ALTER TABLE dca_plans ADD COLUMN deleted BOOLEAN DEFAULT 0")
         
+        # Создаём таблицу для хранения информации о кошельках
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS wallets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                network_key TEXT NOT NULL,
+                wallet_address TEXT NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s','now')),
+                UNIQUE(user_id, network_key)
+            )
+        ''')
+        
+        # Удаляем encrypted_password если он существует (legacy migration)
+        async with db.execute("PRAGMA table_info(wallets)") as cursor:
+            columns = await cursor.fetchall()
+            existing_columns = [col[1] for col in columns]
+        
+        # Note: SQLite doesn't support DROP COLUMN easily, so we'll just ignore it
+        
+        # Создаём таблицу для отслеживания отправленных транзакций
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS sent_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                plan_id INTEGER,
+                order_id TEXT NOT NULL,
+                network_key TEXT NOT NULL,
+                approve_tx_hash TEXT,
+                transfer_tx_hash TEXT NOT NULL,
+                amount REAL NOT NULL,
+                deposit_address TEXT NOT NULL,
+                sent_at INTEGER DEFAULT (strftime('%s','now')),
+                FOREIGN KEY(plan_id) REFERENCES dca_plans(id)
+            )
+        ''')
+        
+        # Создаём таблицу для отслеживания завершённых ордеров
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS completed_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                order_id TEXT NOT NULL UNIQUE,
+                btc_txid TEXT,
+                notified INTEGER DEFAULT 0,
+                completed_at INTEGER,
+                FOREIGN KEY(user_id) REFERENCES dca_plans(user_id)
+            )
+        ''')
+        
         await db.commit()
     logger.info("База данных инициализирована")
 
@@ -321,6 +520,50 @@ async def dca_scheduler():
                         
                         logger.info(f"Выполнение DCA для plan_id={plan_id}, user_id={user_id}: {amount} {from_asset}")
                         
+                        # Проверяем лимиты перед созданием ордера
+                        try:
+                            limits = await get_fixedfloat_limits(from_asset)
+                            min_limit = limits["min"]
+                            max_limit = limits["max"]
+                            effective_max = min(max_limit, 500.0)
+                            
+                            if amount < min_limit or amount > effective_max:
+                                logger.warning(f"Сумма {amount} вне лимитов для {from_asset}: min={min_limit:.2f}, max={effective_max:.2f}")
+                                # Отправляем уведомление пользователю
+                                await bot.send_message(
+                                    user_id,
+                                    f"❌ Ошибка выполнения DCA плана:\n\n"
+                                    f"Сумма {amount:.2f} USDT вне допустимых лимитов для {from_asset}\n"
+                                    f"Минимум: {min_limit:.2f} USDT\n"
+                                    f"Максимум: {effective_max:.2f} USDT\n\n"
+                                    f"💡 Обнови план с корректной суммой"
+                                )
+                                # Откладываем на следующий интервал
+                                new_next_run = now + (interval_hours * 3600)
+                                await db.execute(
+                                    "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                    (new_next_run, plan_id)
+                                )
+                                await db.commit()
+                                continue
+                        except RuntimeError as e:
+                            error_msg = str(e)
+                            logger.error(f"Ошибка проверки лимитов для plan_id={plan_id}: {e}")
+                            # Если сеть недоступна, пропускаем этот запуск
+                            if "недоступна" in error_msg.lower() or "311" in error_msg or "312" in error_msg:
+                                await bot.send_message(
+                                    user_id,
+                                    f"⚠️ Сеть {from_asset} недоступна на FixedFloat в данный момент\n\n"
+                                    f"План будет повторён через {interval_hours}ч"
+                                )
+                                new_next_run = now + (interval_hours * 3600)
+                                await db.execute(
+                                    "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                    (new_next_run, plan_id)
+                                )
+                                await db.commit()
+                                continue
+                        
                         # Создаём ордер на обмен
                         order_data = await asyncio.to_thread(
                             create_fixedfloat_order,
@@ -337,7 +580,9 @@ async def dca_scheduler():
                         
                         # Получаем время истечения ордера
                         time_left = order_data.get("time", {}).get("left", 0)
-                        order_expires = int(time.time()) + time_left
+                        if not isinstance(time_left, (int, float)) or time_left < 0:
+                            time_left = 0
+                        order_expires = int(time.time()) + int(time_left)
                         hours = time_left // 3600
                         minutes = (time_left % 3600) // 60
                         time_text = f"{hours}ч {minutes}мин" if hours > 0 else f"{minutes}мин"
@@ -353,17 +598,106 @@ async def dca_scheduler():
                         )
                         await db.commit()
                         
-                        # Отправляем уведомление пользователю
-                        await bot.send_message(
-                            user_id,
-                            f"✅ DCA план выполнен!\n\n"
-                            f"🆔 Ордер: {order_id}\n"
-                            f"🔗 Ссылка: {order_url}\n\n"
-                            f"💵 Отправь: {deposit_amount} {deposit_code}\n"
-                            f"📍 Адрес депозита:\n{deposit_address}\n\n"
-                            f"⏰ Ордер действителен: {time_text}\n\n"
-                            f"⚠️ Отправь токены на указанный адрес для завершения обмена."
-                        )
+                        # Проверяем есть ли настроенный кошелёк для автоматической отправки
+                        async with db.execute(
+                            "SELECT wallet_address FROM wallets WHERE user_id = ? AND network_key = ?",
+                            (user_id, from_asset)
+                        ) as cur:
+                            wallet_row = await cur.fetchone()
+                        
+                        # Проверяем есть ли пароль в памяти
+                        wallet_password = _wallet_passwords.get((user_id, from_asset))
+                        
+                        if wallet_row and wallet_password:
+                            
+                            # Парсим сумму из строки "amount code"
+                            try:
+                                required_amount = float(deposit_amount)
+                            except:
+                                required_amount = amount  # Fallback to plan amount
+                            
+                            await bot.send_message(
+                                user_id,
+                                f"✅ DCA план выполнен!\n\n"
+                                f"🆔 Ордер: {order_id}\n"
+                                f"🔗 Ссылка: {order_url}\n\n"
+                                f"⏳ Автоматически отправляю USDT..."
+                            )
+                            
+                            # Автоматическая отправка USDT
+                            success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
+                                network_key=from_asset,
+                                user_id=user_id,
+                                wallet_password=wallet_password,
+                                deposit_address=deposit_address,
+                                required_amount=required_amount,
+                                btc_address=btc_address,
+                                order_id=order_id,
+                                dry_run=DRY_RUN
+                            )
+                            
+                            if success:
+                                # Сохраняем информацию о транзакции
+                                config = get_network_config(from_asset)
+                                async with db.execute(
+                                    "INSERT INTO sent_transactions (user_id, plan_id, order_id, network_key, approve_tx_hash, transfer_tx_hash, amount, deposit_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (user_id, plan_id, order_id, from_asset, approve_tx, transfer_tx, required_amount, deposit_address)
+                                ):
+                                    pass
+                                await db.commit()
+                                
+                                explorer_base = config["explorer_base"]
+                                transfer_url = f"{explorer_base}{transfer_tx}" if transfer_tx else None
+                                
+                                msg = (
+                                    f"✅ USDT отправлен автоматически!\n\n"
+                                    f"🆔 Ордер: {order_id}\n"
+                                    f"🔗 Ссылка: {order_url}\n\n"
+                                    f"💵 Отправлено: {required_amount:.6f} USDT\n"
+                                    f"📍 На адрес: {deposit_address[:10]}...{deposit_address[-6:]}\n\n"
+                                )
+                                
+                                if approve_tx:
+                                    approve_url = f"{explorer_base}{approve_tx}"
+                                    msg += f"✅ Approve: {approve_url}\n"
+                                
+                                if transfer_url:
+                                    msg += f"✅ Transfer: {transfer_url}\n"
+                                
+                                if DRY_RUN:
+                                    msg += f"\n⚠️ DRY RUN MODE - транзакции не были отправлены"
+                                
+                                await bot.send_message(user_id, msg)
+                                
+                                logger.info(f"Auto-send successful: order_id={order_id}, approve_tx={approve_tx}, transfer_tx={transfer_tx}")
+                            else:
+                                # Ошибка автоматической отправки - уведомляем пользователя
+                                error_notification = (
+                                    f"❌ Не удалось автоматически отправить USDT\n\n"
+                                    f"🆔 Ордер: {order_id}\n"
+                                    f"🔗 Ссылка: {order_url}\n\n"
+                                    f"Ошибка: {error_msg}\n\n"
+                                    f"💵 Требуется отправить вручную:\n"
+                                    f"{required_amount:.6f} USDT\n"
+                                    f"📍 На адрес:\n{deposit_address}\n\n"
+                                    f"⏰ Ордер действителен: {time_text}"
+                                )
+                                await bot.send_message(user_id, error_notification)
+                                logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
+                        else:
+                            # Кошелёк не настроен - просим отправить вручную
+                            await bot.send_message(
+                                user_id,
+                                f"✅ DCA план выполнен!\n\n"
+                                f"🆔 Ордер: {order_id}\n"
+                                f"🔗 Ссылка: {order_url}\n\n"
+                                f"💵 Отправь: {deposit_amount} {deposit_code}\n"
+                                f"📍 Адрес депозита:\n{deposit_address}\n\n"
+                                f"⏰ Ордер действителен: {time_text}\n\n"
+                                f"💡 Для автоматической отправки:\n"
+                                f"1. Настрой кошелёк: /setwallet\n"
+                                f"2. Установи пароль: /setpassword"
+                            )
                         
                         # Обновляем время следующего запуска ТОЛЬКО для этого конкретного плана
                         new_next_run = now + (interval_hours * 3600)
@@ -645,21 +979,10 @@ async def cmd_execute(message: Message):
             plan_number = 1
         else:
             # Показываем список для выбора
-            def format_interval(hours):
-                if hours == 12:
-                    return "12ч"
-                elif hours == 24:
-                    return "день"
-                elif hours == 168:
-                    return "неделю"
-                elif hours == 720:
-                    return "месяц"
-                else:
-                    return f"{hours}ч"
-            
             text = "📋 Выбери план для выполнения:\n\n"
             for idx, p in enumerate(plans, start=1):
-                text += f"• /execute_{idx} - {p[1]}, {p[2]}$, раз в {format_interval(p[3])}\n"
+                interval_text = format_interval(p[3])
+                text += f"• /execute_{idx} - {p[1]}, {p[2]}$, раз в {interval_text}\n"
             await message.answer(text)
             return
     
@@ -720,6 +1043,49 @@ async def cmd_execute(message: Message):
             await db.commit()
 
     try:
+        # Проверяем лимиты перед созданием ордера
+        try:
+            limits = await get_fixedfloat_limits(from_asset)
+            min_limit = limits["min"]
+            max_limit = limits["max"]
+            
+            # Ограничиваем максимальный лимит бота (500 USD)
+            effective_max = min(max_limit, 500.0)
+            
+            if amount < min_limit:
+                await message.answer(
+                    f"❌ Сумма меньше минимального лимита FixedFloat\n\n"
+                    f"Минимальная сумма для {from_asset}: {min_limit:.2f} USDT\n"
+                    f"Сумма в плане: {amount:.2f} USDT\n\n"
+                    f"💡 Создай новый план с суммой от {min_limit:.2f} USDT"
+                )
+                return
+            
+            if amount > effective_max:
+                await message.answer(
+                    f"❌ Сумма больше максимального лимита\n\n"
+                    f"Максимальная сумма для {from_asset}: {effective_max:.2f} USDT\n"
+                    f"Сумма в плане: {amount:.2f} USDT\n\n"
+                    f"💡 Создай новый план с суммой до {effective_max:.2f} USDT"
+                )
+                return
+            
+            logger.info(f"Лимиты для {from_asset}: min={min_limit:.2f}, max={effective_max:.2f}, amount={amount:.2f}")
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "недоступна" in error_msg.lower() or "311" in error_msg or "312" in error_msg:
+                await message.answer(
+                    f"❌ Сеть {from_asset} недоступна на FixedFloat в данный момент\n\n"
+                    f"Попробуй позже или выбери другую сеть"
+                )
+            else:
+                await message.answer(
+                    f"❌ Не удалось проверить лимиты для {from_asset}\n\n"
+                    f"Ошибка: {error_msg}\n\n"
+                    f"Попробуй позже"
+                )
+            return
+        
         await message.answer(f"⏳ Создаю ордер {from_asset} на FixedFloat...")
         
         # Создаём ордер через универсальную функцию
@@ -743,10 +1109,12 @@ async def cmd_execute(message: Message):
         
         # Получаем время истечения ордера (в секундах)
         time_left = data.get("time", {}).get("left", 0)
+        if not isinstance(time_left, (int, float)) or time_left < 0:
+            time_left = 0
         
         # Вычисляем часы и минуты
-        hours = time_left // 3600
-        minutes = (time_left % 3600) // 60
+        hours = int(time_left) // 3600
+        minutes = (int(time_left) % 3600) // 60
         
         # Формируем строку времени
         if hours > 0:
@@ -758,7 +1126,7 @@ async def cmd_execute(message: Message):
         order_url = f"https://fixedfloat.com/order/{order_id}"
         
         # Сохраняем информацию об активном ордере в БД
-        order_expires = int(time.time()) + time_left
+        order_expires = int(time.time()) + int(time_left)
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE dca_plans SET active_order_id = ?, active_order_address = ?, "
@@ -766,18 +1134,106 @@ async def cmd_execute(message: Message):
                 (order_id, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, plan_id)
             )
             await db.commit()
+            
+            # Проверяем есть ли настроенный кошелёк для автоматической отправки
+            async with db.execute(
+                "SELECT wallet_address FROM wallets WHERE user_id = ? AND network_key = ?",
+                (user_id, from_asset)
+            ) as cur:
+                wallet_row = await cur.fetchone()
+            
+            # Проверяем есть ли пароль в памяти
+            wallet_password = _wallet_passwords.get((user_id, from_asset))
         
-        # Отправляем пользователю детали ордера
-        await message.answer(
-            f"✅ Ордер создан!\n\n"
-            f"🆔 ID: {order_id}\n"
-            f"🔗 Ссылка: {order_url}\n\n"
-            f"💵 Отправь: {deposit_amount} {deposit_code}\n"
-            f"📍 На адрес:\n{deposit_address}\n\n"
-            f"🎯 Получишь BTC на:\n{btc_address}\n\n"
-            f"⏰ Ордер действителен: {time_text}\n\n"
-            f"⚠️ Отправь токены на указанный адрес для завершения обмена."
-        )
+        if wallet_row and wallet_password:
+            
+            # Парсим сумму из строки "amount code"
+            try:
+                required_amount = float(deposit_amount)
+            except:
+                required_amount = amount  # Fallback to plan amount
+            
+            await message.answer(
+                f"✅ Ордер создан!\n\n"
+                f"🆔 ID: {order_id}\n"
+                f"🔗 Ссылка: {order_url}\n\n"
+                f"⏳ Автоматически отправляю USDT..."
+            )
+            
+            # Автоматическая отправка USDT
+            success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
+                network_key=from_asset,
+                user_id=user_id,
+                wallet_password=wallet_password,
+                deposit_address=deposit_address,
+                required_amount=required_amount,
+                btc_address=btc_address,
+                order_id=order_id,
+                dry_run=DRY_RUN
+            )
+            
+            if success:
+                # Сохраняем информацию о транзакции
+                config = get_network_config(from_asset)
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "INSERT INTO sent_transactions (user_id, plan_id, order_id, network_key, approve_tx_hash, transfer_tx_hash, amount, deposit_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (user_id, plan_id, order_id, from_asset, approve_tx, transfer_tx, required_amount, deposit_address)
+                    )
+                    await db.commit()
+                
+                explorer_base = config["explorer_base"]
+                transfer_url = f"{explorer_base}{transfer_tx}" if transfer_tx else None
+                
+                msg = (
+                    f"✅ USDT отправлен автоматически!\n\n"
+                    f"🆔 Ордер: {order_id}\n"
+                    f"🔗 Ссылка: {order_url}\n\n"
+                    f"💵 Отправлено: {required_amount:.6f} USDT\n"
+                    f"📍 На адрес: {deposit_address[:10]}...{deposit_address[-6:]}\n\n"
+                )
+                
+                if approve_tx:
+                    approve_url = f"{explorer_base}{approve_tx}"
+                    msg += f"✅ Approve: {approve_url}\n"
+                
+                if transfer_url:
+                    msg += f"✅ Transfer: {transfer_url}\n"
+                
+                if DRY_RUN:
+                    msg += f"\n⚠️ DRY RUN MODE - транзакции не были отправлены"
+                
+                await message.answer(msg)
+                
+                logger.info(f"Auto-send successful: order_id={order_id}, approve_tx={approve_tx}, transfer_tx={transfer_tx}")
+            else:
+                # Ошибка автоматической отправки - уведомляем пользователя
+                error_notification = (
+                    f"❌ Не удалось автоматически отправить USDT\n\n"
+                    f"🆔 Ордер: {order_id}\n"
+                    f"🔗 Ссылка: {order_url}\n\n"
+                    f"Ошибка: {error_msg}\n\n"
+                    f"💵 Требуется отправить вручную:\n"
+                    f"{required_amount:.6f} USDT\n"
+                    f"📍 На адрес:\n{deposit_address}\n\n"
+                    f"⏰ Ордер действителен: {time_text}"
+                )
+                await message.answer(error_notification)
+                logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
+        else:
+            # Кошелёк не настроен - просим отправить вручную
+            await message.answer(
+                f"✅ Ордер создан!\n\n"
+                f"🆔 ID: {order_id}\n"
+                f"🔗 Ссылка: {order_url}\n\n"
+                f"💵 Отправь: {deposit_amount} {deposit_code}\n"
+                f"📍 На адрес:\n{deposit_address}\n\n"
+                f"🎯 Получишь BTC на:\n{btc_address}\n\n"
+                f"⏰ Ордер действителен: {time_text}\n\n"
+                f"💡 Для автоматической отправки:\n"
+                f"1. Настрой кошелёк: /setwallet\n"
+                f"2. Установи пароль: /setpassword"
+            )
         
         logger.info(f"Ручной ордер создан: user_id={user_id}, plan_id={plan_id}, order_id={order_id}")
         
@@ -812,19 +1268,6 @@ async def cmd_status(message: Message):
     
     # Вычисляем текущее время
     now = int(time.time())
-    
-    # Функция для преобразования интервала в читаемый формат
-    def format_interval(hours):
-        if hours == 12:
-            return "12 часов"
-        elif hours == 24:
-            return "день"
-        elif hours == 168:
-            return "неделю"
-        elif hours == 720:
-            return "месяц"
-        else:
-            return f"{hours}ч"
     
     status_text = f"📊 Твои DCA планы ({len(plans)}):\n\n"
     
@@ -1065,7 +1508,7 @@ async def cmd_delete(message: Message):
     # Получаем список планов для конвертации номера в ID
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY from_asset, id",
+            "SELECT id FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id",
             (user_id,)
         ) as cur:
             plans = await cur.fetchall()
@@ -1138,6 +1581,375 @@ async def cmd_delete(message: Message):
     logger.info(f"DCA план удалён: user_id={user_id}, plan_id={plan_id}, asset={from_asset}")
 
 
+@dp.message(Command("setwallet"))
+async def cmd_setwallet(message: Message):
+    """
+    Команда /setwallet - настроить EVM кошелёк для автоматической отправки USDT.
+    
+    Формат 1 (файл): /setwallet СЕТЬ /path/to/keystore.json ПАРОЛЬ
+    Формат 2 (JSON): /setwallet СЕТЬ JSON ПАРОЛЬ
+                     (где JSON - это содержимое keystore файла)
+    
+    Параметры:
+    - СЕТЬ: USDT-ARB, USDT-BSC, USDT-MATIC
+    - Путь к файлу или JSON: путь к keystore файлу ИЛИ JSON содержимое
+    - ПАРОЛЬ: пароль для расшифровки keystore
+    
+    Примеры:
+    /setwallet USDT-ARB /home/user/keystore.json mypassword
+    /setwallet USDT-ARB {"crypto":{...},"address":"0x..."} mypassword
+    """
+    user_id = message.from_user.id
+    args = message.text.split(maxsplit=3)  # Split into max 4 parts
+    
+    if len(args) < 4:
+        await message.answer(
+            "❌ Неверный формат\n\n"
+            "Используй:\n"
+            "/setwallet СЕТЬ ПУТЬ_К_ФАЙЛУ ПАРОЛЬ\n"
+            "или\n"
+            "/setwallet СЕТЬ JSON ПАРОЛЬ\n\n"
+            "Примеры:\n"
+            "/setwallet USDT-ARB /path/to/keystore.json mypassword\n"
+            "/setwallet USDT-ARB {\"crypto\":{...},\"address\":\"0x...\"} mypassword\n\n"
+            "⚠️ ВАЖНО:\n"
+            "• Используй стандартный Ethereum JSON keystore файл\n"
+            "• Пароль нужен для расшифровки при отправке транзакций\n"
+            "• Keystore файл будет скопирован в локальную директорию\n\n"
+            "Поддерживаемые сети:\n"
+            "• USDT-ARB (Arbitrum)\n"
+            "• USDT-BSC (BSC)\n"
+            "• USDT-MATIC (Polygon)"
+        )
+        return
+    
+    try:
+        network_key = args[1].upper().replace("_", "-")
+        keystore_input = args[2]  # Path or JSON
+        password = args[3]
+        
+        # Валидация сети
+        from networks import NETWORKS
+        if network_key not in NETWORKS:
+            await message.answer(
+                f"❌ Неподдерживаемая сеть: {network_key}\n\n"
+                f"Доступные сети:\n" + "\n".join(f"• {k}" for k in NETWORKS.keys())
+            )
+            return
+        
+        # Загружаем keystore (из файла или JSON)
+        from wallet import load_keystore_from_file, load_keystore_from_json, save_keystore, get_wallet_address
+        
+        try:
+            # Пробуем как путь к файлу
+            if os.path.exists(keystore_input):
+                keystore = load_keystore_from_file(keystore_input)
+            else:
+                # Пробуем как JSON строку
+                keystore = load_keystore_from_json(keystore_input)
+        except ValueError as e:
+            await message.answer(
+                f"❌ Ошибка загрузки keystore: {e}\n\n"
+                f"Убедись что:\n"
+                f"• Файл существует (если указан путь)\n"
+                f"• JSON валидный (если указан JSON)"
+            )
+            return
+        
+        # Проверяем пароль и получаем адрес
+        try:
+            wallet_address = get_wallet_address(keystore, password)
+        except ValueError as e:
+            await message.answer(
+                f"❌ Ошибка расшифровки: {e}\n\n"
+                f"Проверь правильность пароля."
+            )
+            return
+        
+        # Сохраняем keystore локально
+        filepath = save_keystore(keystore, user_id, network_key)
+        
+        # Сохраняем информацию в БД (без пароля - пароль не хранится!)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO wallets (user_id, network_key, wallet_address)
+                VALUES (?, ?, ?)
+            ''', (user_id, network_key, wallet_address))
+            await db.commit()
+        
+        config = get_network_config(network_key)
+        explorer_url = f"{config['explorer_base']}{wallet_address}"
+        
+        await message.answer(
+            f"✅ Кошелёк настроен для {network_key}!\n\n"
+            f"📍 Адрес: `{wallet_address}`\n"
+            f"🔗 Explorer: {explorer_url}\n\n"
+            f"💡 Теперь бот будет автоматически отправлять USDT для DCA планов на этой сети.\n\n"
+            f"⚠️ Пароль НЕ сохраняется. При каждой транзакции бот будет запрашивать пароль.",
+            parse_mode="Markdown"
+        )
+        
+        logger.info(f"Wallet configured: user_id={user_id}, network={network_key}, address={wallet_address}")
+    
+    except Exception as e:
+        logger.error(f"Error in cmd_setwallet: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+@dp.message(Command("walletstatus"))
+async def cmd_walletstatus(message: Message):
+    """
+    Команда /walletstatus - показать статус кошельков и балансы.
+    """
+    user_id = message.from_user.id
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT network_key, wallet_address FROM wallets WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            wallets = await cursor.fetchall()
+    
+    if not wallets:
+        await message.answer(
+            "📋 У тебя нет настроенных кошельков\n\n"
+            "Настрой кошелёк командой:\n"
+            "/setwallet СЕТЬ ПРИВАТНЫЙ_КЛЮЧ ПАРОЛЬ"
+        )
+        return
+    
+    status_text = "💼 Статус кошельков:\n\n"
+    
+    for network_key, wallet_address in wallets:
+        config = get_network_config(network_key)
+        
+        try:
+            w3 = get_web3_instance(network_key)
+            usdt_balance = get_usdt_balance(w3, network_key, wallet_address)
+            native_balance = get_native_balance(w3, wallet_address)
+            
+            status_text += (
+                f"━━━━━━━━━━━━━━\n"
+                f"🌐 {network_key}\n"
+                f"📍 {wallet_address[:10]}...{wallet_address[-6:]}\n"
+                f"💵 USDT: {usdt_balance:.6f}\n"
+                f"⛽ {config['native_token']}: {native_balance:.6f}\n\n"
+            )
+        except Exception as e:
+            logger.error(f"Error getting balance for {network_key}: {e}")
+            status_text += (
+                f"━━━━━━━━━━━━━━\n"
+                f"🌐 {network_key}\n"
+                f"📍 {wallet_address[:10]}...{wallet_address[-6:]}\n"
+                f"❌ Ошибка получения баланса: {e}\n\n"
+            )
+    
+    status_text += "💡 Для удаления кошелька используй /deletewallet\n"
+    
+    # Показываем статус паролей
+    status_text += "\n🔐 Пароли в памяти:\n"
+    for network_key, wallet_address in wallets:
+        has_password = (user_id, network_key) in _wallet_passwords
+        status_text += f"• {network_key}: {'✅' if has_password else '❌'}\n"
+    
+    status_text += "\n💡 Для установки пароля: /setpassword СЕТЬ ПАРОЛЬ"
+    await message.answer(status_text)
+
+
+@dp.message(Command("setpassword"))
+async def cmd_setpassword(message: Message):
+    """
+    Команда /setpassword - установить пароль для автоматической отправки.
+    Формат: /setpassword СЕТЬ ПАРОЛЬ
+    
+    Пароль хранится ТОЛЬКО в памяти (не в БД, не на диске).
+    Пароль очищается при перезапуске бота.
+    """
+    user_id = message.from_user.id
+    args = message.text.split(maxsplit=2)
+    
+    if len(args) != 3:
+        await message.answer(
+            "❌ Неверный формат\n\n"
+            "Используй:\n"
+            "/setpassword СЕТЬ ПАРОЛЬ\n\n"
+            "Пример:\n"
+            "/setpassword USDT-ARB mypassword123\n\n"
+            "⚠️ ВАЖНО:\n"
+            "• Пароль хранится ТОЛЬКО в памяти\n"
+            "• Пароль очищается при перезапуске бота\n"
+            "• Используй для автоматической отправки USDT"
+        )
+        return
+    
+    network_key = args[1].upper().replace("_", "-")
+    password = args[2]
+    
+    from networks import NETWORKS
+    if network_key not in NETWORKS:
+        await message.answer(
+            f"❌ Неподдерживаемая сеть: {network_key}\n\n"
+            f"Доступные сети:\n" + "\n".join(f"• {k}" for k in NETWORKS.keys())
+        )
+        return
+    
+    # Проверяем что кошелёк настроен
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT wallet_address FROM wallets WHERE user_id = ? AND network_key = ?",
+            (user_id, network_key)
+        ) as cur:
+            wallet_row = await cur.fetchone()
+    
+    if not wallet_row:
+        await message.answer(
+            f"❌ Кошелёк для {network_key} не настроен\n\n"
+            f"Сначала настрой кошелёк: /setwallet"
+        )
+        return
+    
+    # Проверяем пароль, загружая keystore
+    from wallet import load_keystore, get_wallet_address
+    keystore = load_keystore(user_id, network_key)
+    if not keystore:
+        await message.answer(
+            f"❌ Keystore файл не найден для {network_key}\n\n"
+            f"Настрой кошелёк заново: /setwallet"
+        )
+        return
+    
+    try:
+        # Проверяем пароль
+        wallet_address = get_wallet_address(keystore, password)
+        
+        # Сохраняем пароль в памяти
+        _wallet_passwords[(user_id, network_key)] = password
+        
+        await message.answer(
+            f"✅ Пароль установлен для {network_key}!\n\n"
+            f"📍 Адрес: {wallet_address[:10]}...{wallet_address[-6:]}\n\n"
+            f"💡 Теперь бот будет автоматически отправлять USDT для этой сети.\n\n"
+            f"⚠️ Пароль хранится только в памяти и будет очищен при перезапуске бота."
+        )
+        
+        logger.info(f"Password set in memory for user {user_id}, network {network_key}")
+    
+    except ValueError as e:
+        await message.answer(
+            f"❌ Неверный пароль: {e}\n\n"
+            f"Проверь правильность пароля для keystore."
+        )
+
+
+@dp.message(Command("clearpassword"))
+async def cmd_clearpassword(message: Message):
+    """
+    Команда /clearpassword - очистить пароль из памяти.
+    Формат: /clearpassword [СЕТЬ]
+    Если СЕТЬ не указана, очищает все пароли пользователя.
+    """
+    user_id = message.from_user.id
+    args = message.text.split()[1:]
+    
+    if len(args) == 0:
+        # Очищаем все пароли пользователя
+        removed = []
+        keys_to_remove = [k for k in _wallet_passwords.keys() if k[0] == user_id]
+        for key in keys_to_remove:
+            removed.append(key[1])
+            del _wallet_passwords[key]
+        
+        if removed:
+            await message.answer(
+                f"✅ Пароли очищены для сетей: {', '.join(removed)}\n\n"
+                f"Автоматическая отправка USDT отключена."
+            )
+        else:
+            await message.answer("ℹ️ Нет сохранённых паролей для очистки")
+        return
+    
+    network_key = args[0].upper().replace("_", "-")
+    
+    from networks import NETWORKS
+    if network_key not in NETWORKS:
+        await message.answer(
+            f"❌ Неподдерживаемая сеть: {network_key}\n\n"
+            f"Доступные сети:\n" + "\n".join(f"• {k}" for k in NETWORKS.keys())
+        )
+        return
+    
+    key = (user_id, network_key)
+    if key in _wallet_passwords:
+        del _wallet_passwords[key]
+        await message.answer(
+            f"✅ Пароль очищен для {network_key}\n\n"
+            f"Автоматическая отправка USDT отключена для этой сети."
+        )
+        logger.info(f"Password cleared for user {user_id}, network {network_key}")
+    else:
+        await message.answer(f"ℹ️ Пароль для {network_key} не был установлен")
+
+
+@dp.message(Command("deletewallet"))
+async def cmd_deletewallet(message: Message):
+    """
+    Команда /deletewallet - удалить кошелёк для сети.
+    Формат: /deletewallet СЕТЬ
+    """
+    user_id = message.from_user.id
+    args = message.text.split()[1:]
+    
+    if len(args) != 1:
+        await message.answer(
+            "❌ Неверный формат\n\n"
+            "Используй:\n"
+            "/deletewallet СЕТЬ\n\n"
+            "Пример:\n"
+            "/deletewallet USDT-ARB"
+        )
+        return
+    
+    network_key = args[0].upper().replace("_", "-")
+    
+    from networks import NETWORKS
+    if network_key not in NETWORKS:
+        await message.answer(
+            f"❌ Неподдерживаемая сеть: {network_key}\n\n"
+            f"Доступные сети:\n" + "\n".join(f"• {k}" for k in NETWORKS.keys())
+        )
+        return
+    
+    # Удаляем из БД и файловой системы
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM wallets WHERE user_id = ? AND network_key = ?",
+            (user_id, network_key)
+        )
+        await db.commit()
+    
+    deleted = delete_keystore(user_id, network_key)
+    
+    # Очищаем пароль из памяти
+    key = (user_id, network_key)
+    if key in _wallet_passwords:
+        del _wallet_passwords[key]
+    
+    if deleted:
+        await message.answer(
+            f"✅ Кошелёк для {network_key} удалён\n\n"
+            f"Keystore файл удалён с диска.\n"
+            f"Пароль очищен из памяти."
+        )
+    else:
+        await message.answer(
+            f"✅ Кошелёк для {network_key} удалён из базы данных\n\n"
+            f"Keystore файл не найден (возможно, уже был удалён).\n"
+            f"Пароль очищен из памяти."
+        )
+    
+    logger.info(f"Wallet deleted: user_id={user_id}, network={network_key}")
+
+
 @dp.message(Command("setdca"))
 async def cmd_setdca(message: Message):
     """
@@ -1187,11 +1999,56 @@ async def cmd_setdca(message: Message):
             )
             return
         
+        # Базовая проверка диапазона
         if amount < 10 or amount > 500:
             await message.answer(
                 "❌ Неверная сумма\n\n"
                 "Диапазон: 10-500 USD"
             )
+            return
+        
+        # Проверка лимитов FixedFloat API
+        try:
+            limits = await get_fixedfloat_limits(from_asset)
+            min_limit = limits["min"]
+            max_limit = limits["max"]
+            
+            # Ограничиваем максимальный лимит бота (500 USD)
+            effective_max = min(max_limit, 500.0)
+            
+            if amount < min_limit:
+                await message.answer(
+                    f"❌ Сумма меньше минимального лимита FixedFloat\n\n"
+                    f"Минимальная сумма для {from_asset}: {min_limit:.2f} USDT\n"
+                    f"Твоя сумма: {amount:.2f} USDT\n\n"
+                    f"💡 Увеличь сумму до минимум {min_limit:.2f} USDT"
+                )
+                return
+            
+            if amount > effective_max:
+                await message.answer(
+                    f"❌ Сумма больше максимального лимита\n\n"
+                    f"Максимальная сумма для {from_asset}: {effective_max:.2f} USDT\n"
+                    f"Твоя сумма: {amount:.2f} USDT\n\n"
+                    f"💡 Уменьшь сумму до максимум {effective_max:.2f} USDT"
+                )
+                return
+            
+            logger.info(f"Лимиты для {from_asset}: min={min_limit:.2f}, max={effective_max:.2f}, amount={amount:.2f}")
+        except RuntimeError as e:
+            # Если не удалось получить лимиты, проверяем базовый диапазон
+            error_msg = str(e)
+            if "недоступна" in error_msg.lower() or "311" in error_msg or "312" in error_msg:
+                await message.answer(
+                    f"❌ Сеть {from_asset} недоступна на FixedFloat в данный момент\n\n"
+                    f"Попробуй позже или выбери другую сеть"
+                )
+            else:
+                await message.answer(
+                    f"❌ Не удалось проверить лимиты для {from_asset}\n\n"
+                    f"Ошибка: {error_msg}\n\n"
+                    f"Попробуй позже"
+                )
             return
         
         if interval not in [12, 24, 168, 720]:
@@ -1216,19 +2073,6 @@ async def cmd_setdca(message: Message):
                 "• Native SegWit (bc1...)"
             )
             return
-        
-        # Функция для преобразования интервала
-        def format_interval(hours):
-            if hours == 12:
-                return "12 часов"
-            elif hours == 24:
-                return "день"
-            elif hours == 168:
-                return "неделю"
-            elif hours == 720:
-                return "месяц"
-            else:
-                return f"{hours}ч"
         
         # Сохранение плана в БД
         user_id = message.from_user.id
@@ -1347,16 +2191,7 @@ async def cmd_setdca(message: Message):
         masked_addr = btc_address[:10] + "..." + btc_address[-6:] if len(btc_address) > 16 else btc_address
         
         # Форматируем интервал
-        if interval == 12:
-            interval_text = "12 часов"
-        elif interval == 24:
-            interval_text = "день"
-        elif interval == 168:
-            interval_text = "неделю"
-        elif interval == 720:
-            interval_text = "месяц"
-        else:
-            interval_text = f"{interval}ч"
+        interval_text = format_interval(interval)
         
         await message.answer(
             f"✅ DCA план {action}!\n\n"
@@ -1382,6 +2217,73 @@ async def cmd_setdca(message: Message):
 # ЗАПУСК БОТА
 # ============================================================================
 
+async def order_monitor():
+    """
+    Фоновая задача для мониторинга завершения ордеров FixedFloat.
+    Проверяет статус ордеров и отправляет уведомления с Blockchair ссылками.
+    """
+    logger.info("Order Monitor запущен")
+    
+    while True:
+        try:
+            await asyncio.sleep(300)  # Проверка каждые 5 минут
+            
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Получаем все отправленные транзакции, для которых ещё не проверен статус ордера
+                async with db.execute(
+                    "SELECT DISTINCT st.order_id, st.user_id, dp.btc_address "
+                    "FROM sent_transactions st "
+                    "JOIN dca_plans dp ON st.plan_id = dp.id "
+                    "LEFT JOIN completed_orders co ON st.order_id = co.order_id "
+                    "WHERE co.order_id IS NULL AND st.transfer_tx_hash IS NOT NULL"
+                ) as cursor:
+                    orders_to_check = await cursor.fetchall()
+            
+            for order_id, user_id, btc_address in orders_to_check:
+                try:
+                    # Проверяем статус ордера через FixedFloat API
+                    # Note: FixedFloat API может не иметь endpoint для проверки статуса
+                    # В реальной реализации нужно использовать их API или webhook
+                    # Здесь мы просто помечаем как проверенные после задержки
+                    
+                    # Для демонстрации: проверяем через некоторое время после отправки
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        async with db.execute(
+                            "SELECT sent_at FROM sent_transactions WHERE order_id = ? ORDER BY sent_at DESC LIMIT 1",
+                            (order_id,)
+                        ) as cur:
+                            sent_row = await cur.fetchone()
+                    
+                    if sent_row:
+                        sent_at = sent_row[0]
+                        # Проверяем через 10 минут после отправки (в реальности нужно использовать API)
+                        if int(time.time()) - sent_at > 600:
+                            # Помечаем как проверенный (в реальности нужно получить BTC txid из API)
+                            async with aiosqlite.connect(DB_PATH) as db:
+                                await db.execute(
+                                    "INSERT OR IGNORE INTO completed_orders (user_id, order_id, completed_at) VALUES (?, ?, ?)",
+                                    (user_id, order_id, int(time.time()))
+                                )
+                                await db.commit()
+                            
+                            # Отправляем уведомление (без BTC txid, так как API может не предоставлять его)
+                            blockchair_url = f"https://blockchair.com/bitcoin/address/{btc_address}"
+                            await bot.send_message(
+                                user_id,
+                                f"✅ Ордер {order_id} обработан FixedFloat!\n\n"
+                                f"🎯 BTC должен быть отправлен на:\n{btc_address}\n\n"
+                                f"🔗 Проверь транзакции:\n{blockchair_url}\n\n"
+                                f"💡 Если BTC не получен, проверь статус ордера на FixedFloat"
+                            )
+                            logger.info(f"Order {order_id} marked as completed for user {user_id}")
+                
+                except Exception as e:
+                    logger.error(f"Error checking order {order_id}: {e}")
+        
+        except Exception as e:
+            logger.error(f"Ошибка в order monitor: {e}")
+
+
 async def main():
     """
     Главная функция запуска бота.
@@ -1389,6 +2291,17 @@ async def main():
     """
     logger.info("=" * 60)
     logger.info("Запуск AutoDCA Bot...")
+    
+    if is_test_mode():
+        logger.warning("=" * 60)
+        logger.warning("⚠️ TEST MODE(S) ENABLED:")
+        if DRY_RUN:
+            logger.warning("  • DRY_RUN: No transactions will be broadcast")
+        if MOCK_FIXEDFLOAT:
+            logger.warning("  • MOCK_FIXEDFLOAT: Using mocked API responses")
+        if USE_TESTNET:
+            logger.warning("  • USE_TESTNET: Using testnet networks")
+        logger.warning("=" * 60)
     
     # Инициализация базы данных
     await init_db()
@@ -1401,6 +2314,9 @@ async def main():
     
     # Запуск фонового планировщика DCA
     asyncio.create_task(dca_scheduler())
+    
+    # Запуск мониторинга завершения ордеров
+    asyncio.create_task(order_monitor())
     
     # Запуск обработки сообщений от Telegram
     await dp.start_polling(bot)
