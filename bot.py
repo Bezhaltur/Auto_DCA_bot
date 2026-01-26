@@ -784,7 +784,7 @@ async def cmd_help(message: Message):
         "/setdca USDT-ARB 50 24 bc1q...\n\n"
         "Параметры:\n"
         "• Сеть: USDT-ARB, USDT-BSC, USDT-MATIC\n"
-        "• Сумма: 10-500 USD\n"
+        "• Сумма: в USD (лимиты зависят от FixedFloat)\n"
         "• Интервал: 12 (12ч), 24 (день), 168 (неделя), 720 (месяц)\n"
         "• BTC адрес: куда получать BTC\n\n"
         "2. Бот автоматически создаст ордера по расписанию\n\n"
@@ -1958,7 +1958,7 @@ async def cmd_setdca(message: Message):
     
     Параметры:
     - СЕТЬ: USDT-ARB, USDT-BSC, USDT-MATIC
-    - СУММА: 10-500 USD
+    - СУММА: сумма в USD (лимиты проверяются через FixedFloat API)
     - ИНТЕРВАЛ: 1, 6, 24, 168 (часов)
     - BTC_АДРЕС: валидный Bitcoin адрес
     """
@@ -1996,14 +1996,6 @@ async def cmd_setdca(message: Message):
             await message.answer(
                 f"❌ Неподдерживаемая сеть: {from_asset}\n\n"
                 f"Доступные сети:\n" + "\n".join(f"• {a}" for a in allowed_assets)
-            )
-            return
-        
-        # Базовая проверка диапазона
-        if amount < 10 or amount > 500:
-            await message.answer(
-                "❌ Неверная сумма\n\n"
-                "Диапазон: 10-500 USD"
             )
             return
         
