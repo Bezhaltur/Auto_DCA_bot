@@ -1,13 +1,14 @@
 """
-Wallet keystore management.
-User provides standard Ethereum JSON keystore files.
-Uses eth_account.Account.decrypt for decryption.
+Wallet keystore management - Single EVM wallet model.
+User provides one private key that works across all networks.
+Password is stored in OS keyring for persistence.
 """
 
 import json
 import os
 from typing import Optional
 from eth_account import Account
+import keyring
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,36 +17,36 @@ logger = logging.getLogger(__name__)
 KEYSTORE_DIR = "keystores"
 os.makedirs(KEYSTORE_DIR, exist_ok=True)
 
+# Keyring service name
+KEYRING_SERVICE = "AutoDCA_Bot"
 
-def generate_keystore_path(user_id: int, network_key: str) -> str:
+
+def generate_keystore_path(user_id: int) -> str:
     """
-    Generate keystore file path for user and network.
+    Generate keystore file path for user (single wallet, not network-specific).
     
     Args:
         user_id: Telegram user ID
-        network_key: Network key (e.g., "USDT-ARB")
     
     Returns:
         Path to keystore file
     """
-    safe_network = network_key.replace("-", "_").lower()
-    filename = f"user_{user_id}_{safe_network}.json"
+    filename = f"user_{user_id}_wallet.json"
     return os.path.join(KEYSTORE_DIR, filename)
 
 
-def save_keystore(keystore: dict, user_id: int, network_key: str) -> str:
+def save_keystore(keystore: dict, user_id: int) -> str:
     """
     Save keystore to file.
     
     Args:
         keystore: Keystore dictionary (standard Ethereum JSON format)
         user_id: Telegram user ID
-        network_key: Network key
     
     Returns:
         Path to saved keystore file
     """
-    filepath = generate_keystore_path(user_id, network_key)
+    filepath = generate_keystore_path(user_id)
     
     with open(filepath, "w") as f:
         json.dump(keystore, f, indent=2)
@@ -57,18 +58,17 @@ def save_keystore(keystore: dict, user_id: int, network_key: str) -> str:
     return filepath
 
 
-def load_keystore(user_id: int, network_key: str) -> Optional[dict]:
+def load_keystore(user_id: int) -> Optional[dict]:
     """
     Load keystore from file.
     
     Args:
         user_id: Telegram user ID
-        network_key: Network key
     
     Returns:
         Keystore dictionary or None if not found
     """
-    filepath = generate_keystore_path(user_id, network_key)
+    filepath = generate_keystore_path(user_id)
     
     if not os.path.exists(filepath):
         return None
@@ -80,52 +80,6 @@ def load_keystore(user_id: int, network_key: str) -> Optional[dict]:
     except Exception as e:
         logger.error(f"Error loading keystore from {filepath}: {e}")
         return None
-
-
-def load_keystore_from_file(filepath: str) -> dict:
-    """
-    Load keystore from external file path.
-    
-    Args:
-        filepath: Path to keystore JSON file
-    
-    Returns:
-        Keystore dictionary
-    
-    Raises:
-        ValueError: If file doesn't exist or is invalid
-    """
-    if not os.path.exists(filepath):
-        raise ValueError(f"Keystore file not found: {filepath}")
-    
-    try:
-        with open(filepath, "r") as f:
-            keystore = json.load(f)
-        return keystore
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in keystore file: {e}")
-    except Exception as e:
-        raise ValueError(f"Error reading keystore file: {e}")
-
-
-def load_keystore_from_json(keystore_json: str) -> dict:
-    """
-    Load keystore from JSON string.
-    
-    Args:
-        keystore_json: JSON string of keystore
-    
-    Returns:
-        Keystore dictionary
-    
-    Raises:
-        ValueError: If JSON is invalid
-    """
-    try:
-        keystore = json.loads(keystore_json)
-        return keystore
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON keystore: {e}")
 
 
 def decrypt_private_key(keystore: dict, password: str) -> str:
@@ -151,34 +105,40 @@ def decrypt_private_key(keystore: dict, password: str) -> str:
         raise ValueError(f"Incorrect password or invalid keystore: {e}")
 
 
-def get_wallet_address(keystore: dict, password: str) -> str:
+def get_wallet_address(keystore: dict) -> str:
     """
-    Get wallet address from keystore.
+    Get wallet address from keystore (no password needed).
     
     Args:
         keystore: Keystore dictionary
-        password: Decryption password
     
     Returns:
         Wallet address (checksummed)
     """
-    private_key = decrypt_private_key(keystore, password)
-    account = Account.from_key("0x" + private_key)
-    return account.address
+    # Address is stored in keystore
+    address = keystore.get("address")
+    if not address:
+        raise ValueError("Invalid keystore: no address field")
+    
+    # Ensure it has 0x prefix and is checksummed
+    if not address.startswith("0x"):
+        address = "0x" + address
+    
+    from web3 import Web3
+    return Web3.to_checksum_address(address)
 
 
-def delete_keystore(user_id: int, network_key: str) -> bool:
+def delete_keystore(user_id: int) -> bool:
     """
     Delete keystore file.
     
     Args:
         user_id: Telegram user ID
-        network_key: Network key
     
     Returns:
         True if deleted, False if not found
     """
-    filepath = generate_keystore_path(user_id, network_key)
+    filepath = generate_keystore_path(user_id)
     
     if os.path.exists(filepath):
         os.remove(filepath)
@@ -188,7 +148,52 @@ def delete_keystore(user_id: int, network_key: str) -> bool:
     return False
 
 
-def keystore_exists(user_id: int, network_key: str) -> bool:
-    """Check if keystore exists for user and network."""
-    filepath = generate_keystore_path(user_id, network_key)
+def keystore_exists(user_id: int) -> bool:
+    """Check if keystore exists for user."""
+    filepath = generate_keystore_path(user_id)
     return os.path.exists(filepath)
+
+
+def save_password_to_keyring(user_id: int, password: str) -> None:
+    """
+    Save password to OS keyring.
+    
+    Args:
+        user_id: Telegram user ID
+        password: Wallet password
+    """
+    username = f"user_{user_id}"
+    keyring.set_password(KEYRING_SERVICE, username, password)
+    logger.info(f"Wallet password saved to keyring for user {user_id}")
+
+
+def load_password_from_keyring(user_id: int) -> Optional[str]:
+    """
+    Load password from OS keyring.
+    
+    Args:
+        user_id: Telegram user ID
+    
+    Returns:
+        Password or None if not found
+    """
+    username = f"user_{user_id}"
+    password = keyring.get_password(KEYRING_SERVICE, username)
+    if password:
+        logger.info(f"Wallet password loaded from keyring for user {user_id}")
+    return password
+
+
+def delete_password_from_keyring(user_id: int) -> None:
+    """
+    Delete password from OS keyring.
+    
+    Args:
+        user_id: Telegram user ID
+    """
+    username = f"user_{user_id}"
+    try:
+        keyring.delete_password(KEYRING_SERVICE, username)
+        logger.info(f"Wallet password deleted from keyring for user {user_id}")
+    except keyring.errors.PasswordDeleteError:
+        pass  # Password was not set

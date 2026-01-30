@@ -67,10 +67,10 @@ async def auto_send_usdt(
         - error_message: Error message if failed
     """
     try:
-        # Load keystore
-        keystore = load_keystore(user_id, network_key)
+        # Load keystore (single wallet for all networks)
+        keystore = load_keystore(user_id)
         if not keystore:
-            return (False, None, None, f"Wallet not configured for {network_key}. Use /setwallet to configure.")
+            return (False, None, None, f"Wallet not configured. Use /setwallet to configure.")
         
         # Decrypt private key (in memory only)
         try:
