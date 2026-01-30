@@ -16,7 +16,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from networks import get_network_config, get_blockchair_url
 from wallet import (
     save_keystore, load_keystore,
-    delete_keystore, get_wallet_address
+    delete_keystore, get_wallet_address,
+    save_password_to_keyring, load_password_from_keyring,
+    delete_password_from_keyring, keystore_exists
 )
 from auto_send import auto_send_usdt
 from erc20 import get_web3_instance, get_usdt_balance, get_native_balance
@@ -54,8 +56,9 @@ from test_config import (
     mask_sensitive_data
 )
 
-# In-memory password storage (NOT persisted to disk or database)
-# Keys: (user_id, network_key) -> password
+# In-memory password cache (loaded from keyring at startup)
+# Keys: user_id -> password
+# This is ONLY a cache - keyring is the single source of truth
 _wallet_passwords = {}
 
 # Маппинг пользовательских названий сетей на коды FixedFloat API
@@ -418,16 +421,18 @@ async def init_db():
             await db.execute("ALTER TABLE dca_plans ADD COLUMN active_order_expires INTEGER")
         if "deleted" not in existing_columns:
             await db.execute("ALTER TABLE dca_plans ADD COLUMN deleted BOOLEAN DEFAULT 0")
+        if "execution_state" not in existing_columns:
+            await db.execute("ALTER TABLE dca_plans ADD COLUMN execution_state TEXT DEFAULT 'scheduled'")
+        if "last_tx_hash" not in existing_columns:
+            await db.execute("ALTER TABLE dca_plans ADD COLUMN last_tx_hash TEXT")
         
-        # Создаём таблицу для хранения информации о кошельках
+        # Создаём таблицу для хранения информации о кошельках (single wallet per user)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS wallets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                network_key TEXT NOT NULL,
+                user_id INTEGER NOT NULL UNIQUE,
                 wallet_address TEXT NOT NULL,
-                created_at INTEGER DEFAULT (strftime('%s','now')),
-                UNIQUE(user_id, network_key)
+                created_at INTEGER DEFAULT (strftime('%s','now'))
             )
         ''')
         
@@ -439,6 +444,7 @@ async def init_db():
         # Note: SQLite doesn't support DROP COLUMN easily, so we'll just ignore it
         
         # Создаём таблицу для отслеживания отправленных транзакций
+        # State tracking for idempotency and restart safety
         await db.execute('''
             CREATE TABLE IF NOT EXISTS sent_transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -447,13 +453,25 @@ async def init_db():
                 order_id TEXT NOT NULL,
                 network_key TEXT NOT NULL,
                 approve_tx_hash TEXT,
-                transfer_tx_hash TEXT NOT NULL,
+                transfer_tx_hash TEXT,
                 amount REAL NOT NULL,
                 deposit_address TEXT NOT NULL,
+                state TEXT DEFAULT 'scheduled',
+                error_message TEXT,
                 sent_at INTEGER DEFAULT (strftime('%s','now')),
                 FOREIGN KEY(plan_id) REFERENCES dca_plans(id)
             )
         ''')
+        
+        # Migrate sent_transactions table to add state and error_message columns if missing
+        async with db.execute("PRAGMA table_info(sent_transactions)") as cursor:
+            columns = await cursor.fetchall()
+            existing_columns = [col[1] for col in columns]
+        
+        if "state" not in existing_columns:
+            await db.execute("ALTER TABLE sent_transactions ADD COLUMN state TEXT DEFAULT 'scheduled'")
+        if "error_message" not in existing_columns:
+            await db.execute("ALTER TABLE sent_transactions ADD COLUMN error_message TEXT")
         
         # Создаём таблицу для отслеживания завершённых ордеров
         await db.execute('''
@@ -514,9 +532,46 @@ async def dca_scheduler():
                         if order_check:
                             existing_order_id, existing_order_expires = order_check
                             if existing_order_id and existing_order_expires and existing_order_expires > now:
-                                # Уже есть активный ордер - пропускаем
-                                logger.info(f"Пропуск DCA для plan_id={plan_id}: уже есть активный ордер {existing_order_id}")
-                                continue
+                                # Check if this order is blocked (can retry) or still in progress
+                                async with db.execute(
+                                    "SELECT state, sent_at FROM sent_transactions WHERE order_id = ? AND plan_id = ?",
+                                    (existing_order_id, plan_id)
+                                ) as state_cur:
+                                    state_row = await state_cur.fetchone()
+                                
+                                if state_row:
+                                    existing_state, last_attempt_time = state_row
+                                    if existing_state == 'sent':
+                                        # Order completed successfully - should not happen with active order
+                                        logger.warning(f"Active order {existing_order_id} already sent, clearing active order")
+                                    elif existing_state == 'sending':
+                                        # Order still being sent - wait
+                                        logger.info(f"Skip DCA plan_id={plan_id}: order {existing_order_id} still sending")
+                                        continue
+                                    elif existing_state == 'blocked':
+                                        # Blocked order - implement strict wait logic
+                                        # Only retry if DCA interval has passed since last attempt
+                                        dca_interval_seconds = interval_hours * 3600
+                                        time_since_attempt = now - (last_attempt_time or now)
+                                        
+                                        if time_since_attempt < dca_interval_seconds:
+                                            # DCA interval not yet reached - do nothing
+                                            logger.info(f"Skip DCA plan_id={plan_id}: blocked order {existing_order_id}, DCA interval not reached (wait {dca_interval_seconds - time_since_attempt}s)")
+                                            continue
+                                        else:
+                                            # DCA interval reached - allow ONE new execution attempt
+                                            logger.info(f"Retry DCA plan_id={plan_id}: blocked order {existing_order_id}, DCA interval reached")
+                                            # Fall through to create new order
+                                    elif existing_state == 'failed':
+                                        # Failed order - already advanced schedule, shouldn't be here
+                                        logger.warning(f"Active order {existing_order_id} failed, clearing active order")
+                                else:
+                                    # No transaction record yet - order exists but not attempted
+                                    logger.info(f"Skip DCA plan_id={plan_id}: active order {existing_order_id} not yet attempted")
+                                    continue
+                            else:
+                                # Order expired - can create new order
+                                logger.info(f"Active order {existing_order_id} expired, creating new order for plan_id={plan_id}")
                         
                         logger.info(f"Выполнение DCA для plan_id={plan_id}, user_id={user_id}: {amount} {from_asset}")
                         
@@ -598,15 +653,15 @@ async def dca_scheduler():
                         )
                         await db.commit()
                         
-                        # Проверяем есть ли настроенный кошелёк для автоматической отправки
+                        # Проверяем есть ли настроенный кошелёк для автоматической отправки (single wallet)
                         async with db.execute(
-                            "SELECT wallet_address FROM wallets WHERE user_id = ? AND network_key = ?",
-                            (user_id, from_asset)
+                            "SELECT wallet_address FROM wallets WHERE user_id = ?",
+                            (user_id,)
                         ) as cur:
                             wallet_row = await cur.fetchone()
                         
-                        # Проверяем есть ли пароль в памяти
-                        wallet_password = _wallet_passwords.get((user_id, from_asset))
+                        # Проверяем есть ли пароль в памяти (user_id key)
+                        wallet_password = _wallet_passwords.get(user_id)
                         
                         if wallet_row and wallet_password:
                             
@@ -616,45 +671,102 @@ async def dca_scheduler():
                             except:
                                 required_amount = amount  # Fallback to plan amount
                             
+                            # Create transaction record in 'sending' state BEFORE attempting send
+                            await db.execute(
+                                "INSERT INTO sent_transactions (user_id, plan_id, order_id, network_key, amount, deposit_address, state) VALUES (?, ?, ?, ?, ?, ?, 'sending')",
+                                (user_id, plan_id, order_id, from_asset, required_amount, deposit_address)
+                            )
+                            await db.commit()
+                            
                             await bot.send_message(
                                 user_id,
-                                f"✅ DCA план выполнен!\n\n"
-                                f"🆔 Ордер: {order_id}\n"
-                                f"🔗 Ссылка: {order_url}\n\n"
-                                f"⏳ Автоматически отправляю USDT..."
+                                f"✅ DCA plan executed!\n\n"
+                                f"🆔 Order: {order_id}\n"
+                                f"🔗 Link: {order_url}\n\n"
+                                f"⏳ Auto-sending USDT..."
                             )
                             
                             # Автоматическая отправка USDT
-                            success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
-                                network_key=from_asset,
-                                user_id=user_id,
-                                wallet_password=wallet_password,
-                                deposit_address=deposit_address,
-                                required_amount=required_amount,
-                                btc_address=btc_address,
-                                order_id=order_id,
-                                dry_run=DRY_RUN
-                            )
+                            try:
+                                success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
+                                    network_key=from_asset,
+                                    user_id=user_id,
+                                    wallet_password=wallet_password,
+                                    deposit_address=deposit_address,
+                                    required_amount=required_amount,
+                                    btc_address=btc_address,
+                                    order_id=order_id,
+                                    dry_run=DRY_RUN
+                                )
+                            except Exception as send_error:
+                                # RPC/Network error - mark as blocked, don't advance schedule
+                                error_str = str(send_error)
+                                logger.error(f"RPC/Network error during auto-send: {error_str}")
+                                
+                                # Check if it's a retryable error (RPC, timeout, connection)
+                                is_retryable = any(keyword in error_str.lower() for keyword in 
+                                    ['timeout', 'connection', 'rpc', '5xx', 'unavailable', 'failed to connect'])
+                                
+                                if is_retryable:
+                                    # Mark as blocked - will retry when DCA interval reached
+                                    await db.execute(
+                                        "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
+                                        (error_str[:500], order_id, plan_id)
+                                    )
+                                    await db.commit()
+                                    
+                                    await bot.send_message(
+                                        user_id,
+                                        f"⚠️ Network/RPC error - execution blocked\n\n"
+                                        f"🆔 Order: {order_id}\n"
+                                        f"Error: {error_str[:200]}\n\n"
+                                        f"Will retry when next DCA interval is reached ({interval_hours}h).\n"
+                                        f"Or use /execute to retry manually."
+                                    )
+                                    # DO NOT advance schedule - will retry
+                                    continue
+                                else:
+                                    # Non-retryable error - mark as failed, advance schedule
+                                    await db.execute(
+                                        "UPDATE sent_transactions SET state = 'failed', error_message = ? WHERE order_id = ? AND plan_id = ?",
+                                        (error_str[:500], order_id, plan_id)
+                                    )
+                                    await db.commit()
+                                    
+                                    await bot.send_message(
+                                        user_id,
+                                        f"❌ Auto-send failed\n\n"
+                                        f"🆔 Order: {order_id}\n"
+                                        f"Error: {error_str[:200]}\n\n"
+                                        f"Please send manually."
+                                    )
+                                    # Advance schedule for failed transactions
+                                    new_next_run = now + (interval_hours * 3600)
+                                    await db.execute(
+                                        "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                        (new_next_run, plan_id)
+                                    )
+                                    await db.commit()
+                                    continue
                             
                             if success:
-                                # Сохраняем информацию о транзакции
+                                # Update transaction record with hashes and 'sent' state
                                 config = get_network_config(from_asset)
-                                async with db.execute(
-                                    "INSERT INTO sent_transactions (user_id, plan_id, order_id, network_key, approve_tx_hash, transfer_tx_hash, amount, deposit_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (user_id, plan_id, order_id, from_asset, approve_tx, transfer_tx, required_amount, deposit_address)
-                                ):
-                                    pass
+                                await db.execute(
+                                    "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'sent' WHERE order_id = ? AND plan_id = ?",
+                                    (approve_tx, transfer_tx, order_id, plan_id)
+                                )
                                 await db.commit()
                                 
                                 explorer_base = config["explorer_base"]
                                 transfer_url = f"{explorer_base}{transfer_tx}" if transfer_tx else None
                                 
                                 msg = (
-                                    f"✅ USDT отправлен автоматически!\n\n"
-                                    f"🆔 Ордер: {order_id}\n"
-                                    f"🔗 Ссылка: {order_url}\n\n"
-                                    f"💵 Отправлено: {required_amount:.6f} USDT\n"
-                                    f"📍 На адрес: {deposit_address[:10]}...{deposit_address[-6:]}\n\n"
+                                    f"✅ USDT sent automatically!\n\n"
+                                    f"🆔 Order: {order_id}\n"
+                                    f"🔗 Link: {order_url}\n\n"
+                                    f"💵 Sent: {required_amount:.6f} USDT\n"
+                                    f"📍 To: {deposit_address[:10]}...{deposit_address[-6:]}\n\n"
                                 )
                                 
                                 if approve_tx:
@@ -665,49 +777,92 @@ async def dca_scheduler():
                                     msg += f"✅ Transfer: {transfer_url}\n"
                                 
                                 if DRY_RUN:
-                                    msg += f"\n⚠️ DRY RUN MODE - транзакции не были отправлены"
+                                    msg += f"\n⚠️ DRY RUN MODE - transactions not broadcast"
                                 
                                 await bot.send_message(user_id, msg)
                                 
                                 logger.info(f"Auto-send successful: order_id={order_id}, approve_tx={approve_tx}, transfer_tx={transfer_tx}")
-                            else:
-                                # Ошибка автоматической отправки - уведомляем пользователя
-                                error_notification = (
-                                    f"❌ Не удалось автоматически отправить USDT\n\n"
-                                    f"🆔 Ордер: {order_id}\n"
-                                    f"🔗 Ссылка: {order_url}\n\n"
-                                    f"Ошибка: {error_msg}\n\n"
-                                    f"💵 Требуется отправить вручную:\n"
-                                    f"{required_amount:.6f} USDT\n"
-                                    f"📍 На адрес:\n{deposit_address}\n\n"
-                                    f"⏰ Ордер действителен: {time_text}"
+                                
+                                # Advance schedule ONLY on successful send
+                                new_next_run = now + (interval_hours * 3600)
+                                await db.execute(
+                                    "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                    (new_next_run, plan_id)
                                 )
-                                await bot.send_message(user_id, error_notification)
-                                logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
+                                await db.commit()
+                            else:
+                                # Check if error is retryable
+                                is_retryable = any(keyword in error_msg.lower() for keyword in 
+                                    ['timeout', 'connection', 'rpc', '5xx', 'unavailable', 'failed to connect'])
+                                
+                                if is_retryable:
+                                    # Mark as blocked - will retry when DCA interval reached
+                                    await db.execute(
+                                        "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
+                                        (error_msg[:500], order_id, plan_id)
+                                    )
+                                    await db.commit()
+                                    
+                                    await bot.send_message(
+                                        user_id,
+                                        f"⚠️ Network/RPC error - execution blocked\n\n"
+                                        f"🆔 Order: {order_id}\n"
+                                        f"Error: {error_msg[:200]}\n\n"
+                                        f"Will retry when next DCA interval is reached ({interval_hours}h).\n"
+                                        f"Or use /execute to retry manually."
+                                    )
+                                    # DO NOT advance schedule
+                                    continue
+                                else:
+                                    # Non-retryable error - mark as failed
+                                    await db.execute(
+                                        "UPDATE sent_transactions SET state = 'failed', error_message = ? WHERE order_id = ? AND plan_id = ?",
+                                        (error_msg[:500], order_id, plan_id)
+                                    )
+                                    await db.commit()
+                                    
+                                    error_notification = (
+                                        f"❌ Failed to auto-send USDT\n\n"
+                                        f"🆔 Order: {order_id}\n"
+                                        f"🔗 Link: {order_url}\n\n"
+                                        f"Error: {error_msg}\n\n"
+                                        f"💵 Please send manually:\n"
+                                        f"{required_amount:.6f} USDT\n"
+                                        f"📍 To:\n{deposit_address}\n\n"
+                                        f"⏰ Order valid for: {time_text}"
+                                    )
+                                    await bot.send_message(user_id, error_notification)
+                                    logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
+                                    
+                                    # Advance schedule ONLY for failed (non-retryable) errors
+                                    new_next_run = now + (interval_hours * 3600)
+                                    await db.execute(
+                                        "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                        (new_next_run, plan_id)
+                                    )
+                                    await db.commit()
                         else:
-                            # Кошелёк не настроен - просим отправить вручную
+                            # Wallet not configured - ask to send manually
                             await bot.send_message(
                                 user_id,
-                                f"✅ DCA план выполнен!\n\n"
-                                f"🆔 Ордер: {order_id}\n"
-                                f"🔗 Ссылка: {order_url}\n\n"
-                                f"💵 Отправь: {deposit_amount} {deposit_code}\n"
-                                f"📍 Адрес депозита:\n{deposit_address}\n\n"
-                                f"⏰ Ордер действителен: {time_text}\n\n"
-                                f"💡 Для автоматической отправки:\n"
-                                f"1. Настрой кошелёк: /setwallet\n"
-                                f"2. Установи пароль: /setpassword"
+                                f"✅ DCA plan executed!\n\n"
+                                f"🆔 Order: {order_id}\n"
+                                f"🔗 Link: {order_url}\n\n"
+                                f"💵 Send: {deposit_amount} {deposit_code}\n"
+                                f"📍 Deposit address:\n{deposit_address}\n\n"
+                                f"⏰ Order valid for: {time_text}\n\n"
+                                f"💡 For auto-send, setup wallet:\n"
+                                f"/setwallet"
                             )
+                            # Advance schedule for manual send case (order created, user notified)
+                            new_next_run = now + (interval_hours * 3600)
+                            await db.execute(
+                                "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                (new_next_run, plan_id)
+                            )
+                            await db.commit()
                         
-                        # Обновляем время следующего запуска ТОЛЬКО для этого конкретного плана
-                        new_next_run = now + (interval_hours * 3600)
-                        await db.execute(
-                            "UPDATE dca_plans SET next_run = ? WHERE id = ?",
-                            (new_next_run, plan_id)
-                        )
-                        await db.commit()
-                        
-                        logger.info(f"DCA выполнен успешно для plan_id={plan_id}, user_id={user_id}, order_id={order_id}")
+                        logger.info(f"DCA execution completed for plan_id={plan_id}, user_id={user_id}, order_id={order_id}")
                         
                     except Exception as e:
                         logger.error(f"Ошибка выполнения DCA для plan_id={plan_id}, user_id={user_id}: {e}")
@@ -749,25 +904,29 @@ async def cmd_start(message: Message):
     username = message.from_user.username or "пользователь"
     
     await message.answer(
-        f"👋 Привет, @{username}!\n\n"
-        f"🤖 **AutoDCA Bot** - автоматические покупки BTC через FixedFloat\n\n"
-        f"📋 **Доступные команды:**\n\n"
-        f"🔧 **Настройка:**\n"
-        f"• `/setdca` - создать DCA план\n"
-        f"• `/status` - посмотреть активные планы\n"
-        f"• `/pause` - приостановить план\n"
-        f"• `/resume` - возобновить план\n\n"
-        f"💱 **Ручные операции:**\n"
-        f"• `/execute` - выполнить обмен вручную\n"
-        f"• `/networks` - посмотреть поддерживаемые сети\n"
-        f"• `/limits` - проверить лимиты обмена\n\n"
-        f"ℹ️ **Информация:**\n"
-        f"• `/help` - подробная справка\n"
-        f"• `/ping` - проверка работы бота\n\n"
-        f"💡 Начни с команды `/setdca` для создания плана автоматических покупок!",
-        parse_mode="Markdown"
+        f"👋 Hi, @{username}!\n\n"
+        f"🤖 AutoDCA Bot - Automatic BTC purchases via FixedFloat\n\n"
+        f"📋 Available commands:\n\n"
+        f"🔧 Setup:\n"
+        f"/setwallet\n"
+        f"/setdca\n"
+        f"/status\n"
+        f"/pause\n"
+        f"/resume\n"
+        f"/delete\n\n"
+        f"💱 Manual operations:\n"
+        f"/execute\n"
+        f"/networks\n"
+        f"/limits\n\n"
+        f"ℹ️ Information:\n"
+        f"/help\n"
+        f"/walletstatus\n"
+        f"/history\n"
+        f"/ping\n\n"
+        f"💡 Start with /setwallet to configure your wallet!",
+        parse_mode=None  # Plain text, no markdown
     )
-    logger.info(f"Новый пользователь: {user_id} (@{username})")
+    logger.info(f"New user: {user_id} (@{username})")
 
 
 @dp.message(Command("help"))
@@ -776,56 +935,56 @@ async def cmd_help(message: Message):
     Команда /help - подробная справка по использованию бота.
     """
     await message.answer(
-        "📖 AutoDCA Bot — автоматическая покупка BTC через FixedFloat\n"
+        "📖 AutoDCA Bot — Local-only Telegram DCA Bot\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ Перед использованием\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1. Добавь в файл .env:\n"
-        "• TELEGRAM_BOT_TOKEN — токен бота из BotFather\n"
-        "• FF_API_KEY — API key из FixedFloat\n"
-        "• FF_API_SECRET — API secret из FixedFloat\n\n"
-        "2. BTC-адрес указывается при создании DCA-плана\n"
-        "   (это адрес, на который FixedFloat отправит BTC)\n\n"
-        "3. Для автоматического режима потребуется EVM-кошелёк\n"
-        "   в формате Ethereum keystore (JSON-файл)\n\n"
-        "   Keystore (JSON) — это зашифрованный файл кошелька.\n"
-        "   Его можно экспортировать из MetaMask.\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "Бот работает в ДВУХ режимах:\n"
+        "🔐 Wallet Setup (One Time)\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "🔵 Ручной режим (Manual)\n"
-        "• Бот создаёт ордер на FixedFloat\n"
-        "• Присылает адрес и сумму\n"
-        "• Ты отправляешь USDT вручную\n"
-        "• BTC приходит на указанный BTC-адрес\n\n"
-        "🟢 Автоматический режим (Auto-send)\n"
-        "• Бот сам отправляет USDT по расписанию согласно стратегии\n"
-        "• Работает только при локальном запуске бота\n"
-        "• Можно включать и выключать в любой момент\n\n"
+        "1. Create wallet.json in the bot folder:\n\n"
+        "```json\n"
+        "{\n"
+        '  "private_key": "0xYOUR_PRIVATE_KEY",\n'
+        '  "password": "YOUR_PASSWORD"\n'
+        "}\n"
+        "```\n\n"
+        "2. Run:\n"
+        "/setwallet\n\n"
+        "That's it! Your wallet is now configured.\n\n"
+        "⚠️ IMPORTANT:\n"
+        "• Private key NEVER leaves your machine\n"
+        "• After setup, it is encrypted and removed\n"
+        "• Bot must run locally (not in cloud)\n"
+        "• Restart does NOT disable auto-send\n"
+        "• Password stored in OS keyring (secure)\n"
+        "• Same wallet works for ALL networks\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "⚙️ Настройка Auto-send\n"
+        "💱 How It Works\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "1. Create DCA plan: /setdca\n"
+        "2. Bot runs 24/7 on schedule\n"
+        "3. Auto-sends USDT to FixedFloat\n"
+        "4. BTC arrives to your address\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "1. /setwallet — добавить кошелёк (Ethereum keystore JSON)\n"
-        "2. /setpassword — сохранить пароль (через OS Keyring)\n"
-        "3. /autosend_on — включить автоотправку\n"
-        "4. /autosend_off — отключить автоотправку\n\n"
+        "ℹ️ Commands\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "ℹ️ Команды\n"
+        "/setdca        — create DCA plan\n"
+        "/status        — view active plans\n"
+        "/execute       — execute plan manually\n"
+        "/pause         — pause a plan\n"
+        "/resume        — resume a plan\n"
+        "/delete        — delete a plan\n"
+        "/limits        — check exchange limits\n"
+        "/history       — view order history\n"
+        "/walletstatus  — check wallet balances\n"
+        "/networks      — supported networks\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "/setdca        — создать DCA-план\n"
-        "/status        — статус планов и auto-send\n"
-        "/execute       — выполнить покупку вручную\n"
-        "/limits        — лимиты FixedFloat\n"
-        "/history       — история выполненных ордеров\n"
-        "/autosend_on   — включить auto-send\n"
-        "/autosend_off  — отключить auto-send\n\n"
+        "🔐 Security Model\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "🔐 Безопасность\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "• Приватные ключи не хранятся\n"
-        "• Используется стандартный Ethereum keystore (JSON)\n"
-        "• Пароль хранится в системном keyring (Windows / macOS)\n"
-        "• Бот работает локально, средства всегда под контролем пользователя"
+        "• Equivalent to MetaMask / always-on wallet\n"
+        "• All funds under YOUR control\n"
+        "• Bot runs ONLY locally\n"
+        "• No cloud, no third parties\n"
+        "• Private keys never stored unencrypted\n"
+        "• Password in OS keyring (Windows/macOS/Linux)"
     )
 
 
@@ -1616,110 +1775,113 @@ async def cmd_delete(message: Message):
 @dp.message(Command("setwallet"))
 async def cmd_setwallet(message: Message):
     """
-    Команда /setwallet - настроить EVM кошелёк для автоматической отправки USDT.
+    Команда /setwallet - настроить единый EVM кошелёк (NO ARGUMENTS).
     
-    Формат 1 (файл): /setwallet СЕТЬ /path/to/keystore.json ПАРОЛЬ
-    Формат 2 (JSON): /setwallet СЕТЬ JSON ПАРОЛЬ
-                     (где JSON - это содержимое keystore файла)
+    Читает wallet.json из корня проекта:
+    {
+      "private_key": "0xYOUR_PRIVATE_KEY",
+      "password": "STRONG_PASSWORD"
+    }
     
-    Параметры:
-    - СЕТЬ: USDT-ARB, USDT-BSC, USDT-MATIC
-    - Путь к файлу или JSON: путь к keystore файлу ИЛИ JSON содержимое
-    - ПАРОЛЬ: пароль для расшифровки keystore
-    
-    Примеры:
-    /setwallet USDT-ARB /home/user/keystore.json mypassword
-    /setwallet USDT-ARB {"crypto":{...},"address":"0x..."} mypassword
+    Создаёт keystore, сохраняет пароль в keyring, перезаписывает wallet.json.
     """
     user_id = message.from_user.id
-    args = message.text.split(maxsplit=3)  # Split into max 4 parts
     
-    if len(args) < 4:
+    # Check if keystore already exists
+    if keystore_exists(user_id):
         await message.answer(
-            "❌ Неверный формат\n\n"
-            "Используй:\n"
-            "/setwallet СЕТЬ ПУТЬ_К_ФАЙЛУ ПАРОЛЬ\n"
-            "или\n"
-            "/setwallet СЕТЬ JSON ПАРОЛЬ\n\n"
-            "Примеры:\n"
-            "/setwallet USDT-ARB /path/to/keystore.json mypassword\n"
-            "/setwallet USDT-ARB {\"crypto\":{...},\"address\":\"0x...\"} mypassword\n\n"
-            "⚠️ ВАЖНО:\n"
-            "• Используй стандартный Ethereum JSON keystore файл\n"
-            "• Пароль нужен для расшифровки при отправке транзакций\n"
-            "• Keystore файл будет скопирован в локальную директорию\n\n"
-            "Поддерживаемые сети:\n"
-            "• USDT-ARB (Arbitrum)\n"
-            "• USDT-BSC (BSC)\n"
-            "• USDT-MATIC (Polygon)"
+            "❌ Wallet already initialized\n\n"
+            "If you need to reset your wallet, please contact support or manually delete the keystore."
+        )
+        return
+    
+    # Read wallet.json from project root
+    wallet_json_path = "wallet.json"
+    if not os.path.exists(wallet_json_path):
+        await message.answer(
+            "❌ wallet.json not found\n\n"
+            "Create wallet.json in the bot folder with:\n\n"
+            "```json\n"
+            "{\n"
+            '  "private_key": "0xYOUR_PRIVATE_KEY",\n'
+            '  "password": "YOUR_PASSWORD"\n'
+            "}\n"
+            "```\n\n"
+            "Then run /setwallet again",
+            parse_mode="Markdown"
         )
         return
     
     try:
-        network_key = args[1].upper().replace("_", "-")
-        keystore_input = args[2]  # Path or JSON
-        password = args[3]
+        with open(wallet_json_path, "r") as f:
+            wallet_data = json.load(f)
         
-        # Валидация сети
-        from networks import NETWORKS
-        if network_key not in NETWORKS:
+        private_key = wallet_data.get("private_key")
+        password = wallet_data.get("password")
+        
+        if not private_key or not password:
             await message.answer(
-                f"❌ Неподдерживаемая сеть: {network_key}\n\n"
-                f"Доступные сети:\n" + "\n".join(f"• {k}" for k in NETWORKS.keys())
+                "❌ Invalid wallet.json format\n\n"
+                "Required fields:\n"
+                "• private_key\n"
+                "• password"
             )
             return
         
-        # Загружаем keystore (из файла или JSON)
-        from wallet import load_keystore_from_file, load_keystore_from_json, save_keystore, get_wallet_address
+        # Validate private key format
+        if not private_key.startswith("0x"):
+            private_key = "0x" + private_key
         
-        try:
-            # Пробуем как путь к файлу
-            if os.path.exists(keystore_input):
-                keystore = load_keystore_from_file(keystore_input)
-            else:
-                # Пробуем как JSON строку
-                keystore = load_keystore_from_json(keystore_input)
-        except ValueError as e:
-            await message.answer(
-                f"❌ Ошибка загрузки keystore: {e}\n\n"
-                f"Убедись что:\n"
-                f"• Файл существует (если указан путь)\n"
-                f"• JSON валидный (если указан JSON)"
-            )
-            return
+        # Create Ethereum keystore using eth_account
+        from eth_account import Account
+        account = Account.from_key(private_key)
+        wallet_address = account.address
         
-        # Проверяем пароль и получаем адрес
-        try:
-            wallet_address = get_wallet_address(keystore, password)
-        except ValueError as e:
-            await message.answer(
-                f"❌ Ошибка расшифровки: {e}\n\n"
-                f"Проверь правильность пароля."
-            )
-            return
+        # Encrypt to create keystore (v3)
+        keystore = account.encrypt(password)
         
-        # Сохраняем keystore локально
-        filepath = save_keystore(keystore, user_id, network_key)
+        # Save keystore using existing storage logic
+        save_keystore(keystore, user_id)
         
-        # Сохраняем информацию в БД (без пароля - пароль не хранится!)
+        # Store password in OS keyring (single source of truth)
+        save_password_to_keyring(user_id, password)
+        
+        # Populate in-memory cache
+        _wallet_passwords[user_id] = password
+        
+        # Delete private_key from memory explicitly
+        private_key = None
+        del private_key
+        
+        # Overwrite wallet.json to contain ONLY keystore
+        with open(wallet_json_path, "w") as f:
+            json.dump({"keystore": keystore}, f, indent=2)
+        
+        # Save wallet address to database
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute('''
-                INSERT OR REPLACE INTO wallets (user_id, network_key, wallet_address)
-                VALUES (?, ?, ?)
-            ''', (user_id, network_key, wallet_address))
+                INSERT OR REPLACE INTO wallets (user_id, wallet_address)
+                VALUES (?, ?)
+            ''', (user_id, wallet_address))
             await db.commit()
         
-        config = get_network_config(network_key)
-        explorer_url = f"{config['explorer_base']}{wallet_address}"
-        
         await message.answer(
-            f"✅ Кошелёк настроен для {network_key}!\n\n"
-            f"📍 Адрес: `{wallet_address}`\n"
-            f"🔗 Explorer: {explorer_url}\n\n"
-            f"💡 Теперь бот будет автоматически отправлять USDT для DCA планов на этой сети.\n\n"
-            f"⚠️ Пароль НЕ сохраняется. При каждой транзакции бот будет запрашивать пароль.",
+            f"✅ Wallet initialized successfully!\n\n"
+            f"📍 Address: `{wallet_address}`\n\n"
+            f"🔐 Security:\n"
+            f"• Private key has been encrypted and removed\n"
+            f"• Password stored in OS keyring\n"
+            f"• wallet.json has been overwritten\n\n"
+            f"⚠️ DELETE any backup copies of wallet.json containing the private key!\n\n"
+            f"💡 Auto-send is now enabled for all networks",
             parse_mode="Markdown"
         )
+        
+        logger.info(f"Wallet initialized for user {user_id}: address={wallet_address}")
+    
+    except Exception as e:
+        logger.error(f"Error in cmd_setwallet: {e}", exc_info=True)
+        await message.answer(f"❌ Error: {e}")
         
         logger.info(f"Wallet configured: user_id={user_id}, network={network_key}, address={wallet_address}")
     
@@ -1731,28 +1893,32 @@ async def cmd_setwallet(message: Message):
 @dp.message(Command("walletstatus"))
 async def cmd_walletstatus(message: Message):
     """
-    Команда /walletstatus - показать статус кошельков и балансы.
+    Команда /walletstatus - показать статус кошелька и балансы на всех сетях.
     """
     user_id = message.from_user.id
     
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT network_key, wallet_address FROM wallets WHERE user_id = ?",
+            "SELECT wallet_address FROM wallets WHERE user_id = ?",
             (user_id,)
         ) as cursor:
-            wallets = await cursor.fetchall()
+            wallet_row = await cursor.fetchone()
     
-    if not wallets:
+    if not wallet_row:
         await message.answer(
-            "📋 У тебя нет настроенных кошельков\n\n"
-            "Настрой кошелёк командой:\n"
-            "/setwallet СЕТЬ ПРИВАТНЫЙ_КЛЮЧ ПАРОЛЬ"
+            "📋 Wallet not configured\n\n"
+            "Setup your wallet:\n"
+            "/setwallet"
         )
         return
     
-    status_text = "💼 Статус кошельков:\n\n"
+    wallet_address = wallet_row[0]
+    status_text = f"💼 Wallet Status:\n\n"
+    status_text += f"📍 Address: {wallet_address[:10]}...{wallet_address[-6:]}\n\n"
+    status_text += f"Balances on all networks:\n\n"
     
-    for network_key, wallet_address in wallets:
+    from networks import NETWORKS
+    for network_key in NETWORKS.keys():
         config = get_network_config(network_key)
         
         try:
@@ -1762,8 +1928,7 @@ async def cmd_walletstatus(message: Message):
             
             status_text += (
                 f"━━━━━━━━━━━━━━\n"
-                f"🌐 {network_key}\n"
-                f"📍 {wallet_address[:10]}...{wallet_address[-6:]}\n"
+                f"🌐 {config['name']}\n"
                 f"💵 USDT: {usdt_balance:.6f}\n"
                 f"⛽ {config['native_token']}: {native_balance:.6f}\n\n"
             )
@@ -1771,215 +1936,60 @@ async def cmd_walletstatus(message: Message):
             logger.error(f"Error getting balance for {network_key}: {e}")
             status_text += (
                 f"━━━━━━━━━━━━━━\n"
-                f"🌐 {network_key}\n"
-                f"📍 {wallet_address[:10]}...{wallet_address[-6:]}\n"
-                f"❌ Ошибка получения баланса: {e}\n\n"
+                f"🌐 {config['name']}\n"
+                f"❌ Error: {str(e)[:50]}\n\n"
             )
     
-    status_text += "💡 Для удаления кошелька используй /deletewallet\n"
+    # Show password status
+    has_password = user_id in _wallet_passwords
+    status_text += f"\n🔐 Password in keyring: {'✅' if has_password else '❌'}\n"
     
-    # Показываем статус паролей
-    status_text += "\n🔐 Пароли в памяти:\n"
-    for network_key, wallet_address in wallets:
-        has_password = (user_id, network_key) in _wallet_passwords
-        status_text += f"• {network_key}: {'✅' if has_password else '❌'}\n"
+    if not has_password:
+        status_text += "\n⚠️ No password found. Auto-send disabled."
     
-    status_text += "\n💡 Для установки пароля: /setpassword СЕТЬ ПАРОЛЬ"
     await message.answer(status_text)
 
-
-@dp.message(Command("setpassword"))
-async def cmd_setpassword(message: Message):
-    """
-    Команда /setpassword - установить пароль для автоматической отправки.
-    Формат: /setpassword СЕТЬ ПАРОЛЬ
-    
-    Пароль хранится ТОЛЬКО в памяти (не в БД, не на диске).
-    Пароль очищается при перезапуске бота.
-    """
-    user_id = message.from_user.id
-    args = message.text.split(maxsplit=2)
-    
-    if len(args) != 3:
-        await message.answer(
-            "❌ Неверный формат\n\n"
-            "Используй:\n"
-            "/setpassword СЕТЬ ПАРОЛЬ\n\n"
-            "Пример:\n"
-            "/setpassword USDT-ARB mypassword123\n\n"
-            "⚠️ ВАЖНО:\n"
-            "• Пароль хранится ТОЛЬКО в памяти\n"
-            "• Пароль очищается при перезапуске бота\n"
-            "• Используй для автоматической отправки USDT"
-        )
-        return
-    
-    network_key = args[1].upper().replace("_", "-")
-    password = args[2]
-    
-    from networks import NETWORKS
-    if network_key not in NETWORKS:
-        await message.answer(
-            f"❌ Неподдерживаемая сеть: {network_key}\n\n"
-            f"Доступные сети:\n" + "\n".join(f"• {k}" for k in NETWORKS.keys())
-        )
-        return
-    
-    # Проверяем что кошелёк настроен
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT wallet_address FROM wallets WHERE user_id = ? AND network_key = ?",
-            (user_id, network_key)
-        ) as cur:
-            wallet_row = await cur.fetchone()
-    
-    if not wallet_row:
-        await message.answer(
-            f"❌ Кошелёк для {network_key} не настроен\n\n"
-            f"Сначала настрой кошелёк: /setwallet"
-        )
-        return
-    
-    # Проверяем пароль, загружая keystore
-    from wallet import load_keystore, get_wallet_address
-    keystore = load_keystore(user_id, network_key)
-    if not keystore:
-        await message.answer(
-            f"❌ Keystore файл не найден для {network_key}\n\n"
-            f"Настрой кошелёк заново: /setwallet"
-        )
-        return
-    
-    try:
-        # Проверяем пароль
-        wallet_address = get_wallet_address(keystore, password)
-        
-        # Сохраняем пароль в памяти
-        _wallet_passwords[(user_id, network_key)] = password
-        
-        await message.answer(
-            f"✅ Пароль установлен для {network_key}!\n\n"
-            f"📍 Адрес: {wallet_address[:10]}...{wallet_address[-6:]}\n\n"
-            f"💡 Теперь бот будет автоматически отправлять USDT для этой сети.\n\n"
-            f"⚠️ Пароль хранится только в памяти и будет очищен при перезапуске бота."
-        )
-        
-        logger.info(f"Password set in memory for user {user_id}, network {network_key}")
-    
-    except ValueError as e:
-        await message.answer(
-            f"❌ Неверный пароль: {e}\n\n"
-            f"Проверь правильность пароля для keystore."
-        )
-
-
-@dp.message(Command("clearpassword"))
-async def cmd_clearpassword(message: Message):
-    """
-    Команда /clearpassword - очистить пароль из памяти.
-    Формат: /clearpassword [СЕТЬ]
-    Если СЕТЬ не указана, очищает все пароли пользователя.
-    """
-    user_id = message.from_user.id
-    args = message.text.split()[1:]
-    
-    if len(args) == 0:
-        # Очищаем все пароли пользователя
-        removed = []
-        keys_to_remove = [k for k in _wallet_passwords.keys() if k[0] == user_id]
-        for key in keys_to_remove:
-            removed.append(key[1])
-            del _wallet_passwords[key]
-        
-        if removed:
-            await message.answer(
-                f"✅ Пароли очищены для сетей: {', '.join(removed)}\n\n"
-                f"Автоматическая отправка USDT отключена."
-            )
-        else:
-            await message.answer("ℹ️ Нет сохранённых паролей для очистки")
-        return
-    
-    network_key = args[0].upper().replace("_", "-")
-    
-    from networks import NETWORKS
-    if network_key not in NETWORKS:
-        await message.answer(
-            f"❌ Неподдерживаемая сеть: {network_key}\n\n"
-            f"Доступные сети:\n" + "\n".join(f"• {k}" for k in NETWORKS.keys())
-        )
-        return
-    
-    key = (user_id, network_key)
-    if key in _wallet_passwords:
-        del _wallet_passwords[key]
-        await message.answer(
-            f"✅ Пароль очищен для {network_key}\n\n"
-            f"Автоматическая отправка USDT отключена для этой сети."
-        )
-        logger.info(f"Password cleared for user {user_id}, network {network_key}")
-    else:
-        await message.answer(f"ℹ️ Пароль для {network_key} не был установлен")
 
 
 @dp.message(Command("deletewallet"))
 async def cmd_deletewallet(message: Message):
     """
-    Команда /deletewallet - удалить кошелёк для сети.
-    Формат: /deletewallet СЕТЬ
+    Команда /deletewallet - удалить кошелёк пользователя.
+    Формат: /deletewallet (no arguments)
     """
     user_id = message.from_user.id
-    args = message.text.split()[1:]
-    
-    if len(args) != 1:
-        await message.answer(
-            "❌ Неверный формат\n\n"
-            "Используй:\n"
-            "/deletewallet СЕТЬ\n\n"
-            "Пример:\n"
-            "/deletewallet USDT-ARB"
-        )
-        return
-    
-    network_key = args[0].upper().replace("_", "-")
-    
-    from networks import NETWORKS
-    if network_key not in NETWORKS:
-        await message.answer(
-            f"❌ Неподдерживаемая сеть: {network_key}\n\n"
-            f"Доступные сети:\n" + "\n".join(f"• {k}" for k in NETWORKS.keys())
-        )
-        return
     
     # Удаляем из БД и файловой системы
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "DELETE FROM wallets WHERE user_id = ? AND network_key = ?",
-            (user_id, network_key)
+            "DELETE FROM wallets WHERE user_id = ?",
+            (user_id,)
         )
         await db.commit()
     
-    deleted = delete_keystore(user_id, network_key)
+    deleted = delete_keystore(user_id)
     
-    # Очищаем пароль из памяти
-    key = (user_id, network_key)
-    if key in _wallet_passwords:
-        del _wallet_passwords[key]
+    # Очищаем пароль из keyring и памяти
+    delete_password_from_keyring(user_id)
+    if user_id in _wallet_passwords:
+        del _wallet_passwords[user_id]
     
     if deleted:
         await message.answer(
-            f"✅ Кошелёк для {network_key} удалён\n\n"
-            f"Keystore файл удалён с диска.\n"
-            f"Пароль очищен из памяти."
+            f"✅ Wallet deleted\n\n"
+            f"• Keystore file removed from disk\n"
+            f"• Password removed from keyring\n"
+            f"• Auto-send disabled"
         )
     else:
         await message.answer(
-            f"✅ Кошелёк для {network_key} удалён из базы данных\n\n"
-            f"Keystore файл не найден (возможно, уже был удалён).\n"
-            f"Пароль очищен из памяти."
+            f"✅ Wallet deleted from database\n\n"
+            f"• Keystore file not found (may have been already deleted)\n"
+            f"• Password removed from keyring\n"
+            f"• Auto-send disabled"
         )
     
-    logger.info(f"Wallet deleted: user_id={user_id}, network={network_key}")
+    logger.info(f"Wallet deleted: user_id={user_id}")
 
 
 @dp.message(Command("setdca"))
@@ -2316,6 +2326,29 @@ async def order_monitor():
             logger.error(f"Ошибка в order monitor: {e}")
 
 
+async def load_passwords_at_startup():
+    """
+    Load passwords from OS keyring into memory cache at bot startup.
+    This ensures auto-send continues to work after restarts.
+    """
+    logger.info("Loading wallet passwords from keyring...")
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM wallets") as cursor:
+            users = await cursor.fetchall()
+    
+    for (user_id,) in users:
+        password = load_password_from_keyring(user_id)
+        if password:
+            _wallet_passwords[user_id] = password
+            logger.info(f"Wallet password loaded from keyring for user {user_id}")
+        else:
+            logger.warning(f"No password in keyring for user {user_id}")
+
+
+
+
+
 async def main():
     """
     Главная функция запуска бота.
@@ -2337,6 +2370,9 @@ async def main():
     
     # Инициализация базы данных
     await init_db()
+    
+    # Load passwords from keyring into memory cache
+    await load_passwords_at_startup()
     
     # Обновление актуальных кодов сетей из FixedFloat
     await update_network_codes()

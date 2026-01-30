@@ -46,3 +46,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Wallet files (CRITICAL - never commit)
+wallet.json
+keystores/
