@@ -93,7 +93,7 @@ scheduled → sending → sent (success, advance schedule)
 **What `blocked` means:**
 - Execution NOT completed
 - Transaction record created but send failed due to RPC/network error
-- Will be retried when next DCA interval arrives
+- Will be retried when next DCA interval arrives (NOT on every scheduler tick)
 - Schedule is NOT advanced
 
 **What happens on restart:**
@@ -102,17 +102,20 @@ scheduled → sending → sent (success, advance schedule)
 - Next DCA interval will trigger retry attempt
 
 **What happens on next scheduler tick:**
-- If `next_run <= now`, scheduler attempts execution
-- Checks active_order_id for the plan
-- If order is blocked: creates NEW order (automatic retry)
+- If `next_run <= now`, scheduler checks the plan
+- Checks active_order_id and its state
+- If order is blocked:
+  - Checks if DCA interval has passed since last attempt
+  - If interval NOT reached: skips silently (no action)
+  - If interval reached: creates NEW order (retry)
 - If order is sending: waits (order in progress)
 - If order expired: creates NEW order (normal execution)
-- Blocked orders are retried automatically, no infinite loop
+- Blocked orders are retried ONLY when DCA interval is reached
 
-**What happens on restart:**
-- Blocked transactions remain blocked (not reset)
-- Password loaded from keyring
-- Next scheduler tick will retry blocked orders (see above)
+**Strict Wait Logic:**
+- `time_since_attempt = now - last_attempt_time`
+- If `time_since_attempt < dca_interval`: Do nothing (skip)
+- If `time_since_attempt >= dca_interval`: Allow retry (create new order)
 
 ## Testing
 

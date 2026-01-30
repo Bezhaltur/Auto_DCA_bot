@@ -534,13 +534,13 @@ async def dca_scheduler():
                             if existing_order_id and existing_order_expires and existing_order_expires > now:
                                 # Check if this order is blocked (can retry) or still in progress
                                 async with db.execute(
-                                    "SELECT state FROM sent_transactions WHERE order_id = ? AND plan_id = ?",
+                                    "SELECT state, sent_at FROM sent_transactions WHERE order_id = ? AND plan_id = ?",
                                     (existing_order_id, plan_id)
                                 ) as state_cur:
                                     state_row = await state_cur.fetchone()
                                 
                                 if state_row:
-                                    existing_state = state_row[0]
+                                    existing_state, last_attempt_time = state_row
                                     if existing_state == 'sent':
                                         # Order completed successfully - should not happen with active order
                                         logger.warning(f"Active order {existing_order_id} already sent, clearing active order")
@@ -549,9 +549,19 @@ async def dca_scheduler():
                                         logger.info(f"Skip DCA plan_id={plan_id}: order {existing_order_id} still sending")
                                         continue
                                     elif existing_state == 'blocked':
-                                        # Blocked order - can retry by creating new order
-                                        logger.info(f"Retry DCA plan_id={plan_id}: previous order {existing_order_id} was blocked")
-                                        # Fall through to create new order
+                                        # Blocked order - implement strict wait logic
+                                        # Only retry if DCA interval has passed since last attempt
+                                        dca_interval_seconds = interval_hours * 3600
+                                        time_since_attempt = now - (last_attempt_time or now)
+                                        
+                                        if time_since_attempt < dca_interval_seconds:
+                                            # DCA interval not yet reached - do nothing
+                                            logger.info(f"Skip DCA plan_id={plan_id}: blocked order {existing_order_id}, DCA interval not reached (wait {dca_interval_seconds - time_since_attempt}s)")
+                                            continue
+                                        else:
+                                            # DCA interval reached - allow ONE new execution attempt
+                                            logger.info(f"Retry DCA plan_id={plan_id}: blocked order {existing_order_id}, DCA interval reached")
+                                            # Fall through to create new order
                                     elif existing_state == 'failed':
                                         # Failed order - already advanced schedule, shouldn't be here
                                         logger.warning(f"Active order {existing_order_id} failed, clearing active order")
@@ -698,7 +708,7 @@ async def dca_scheduler():
                                     ['timeout', 'connection', 'rpc', '5xx', 'unavailable', 'failed to connect'])
                                 
                                 if is_retryable:
-                                    # Mark as blocked - will retry on next tick
+                                    # Mark as blocked - will retry when DCA interval reached
                                     await db.execute(
                                         "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
                                         (error_str[:500], order_id, plan_id)
@@ -707,10 +717,11 @@ async def dca_scheduler():
                                     
                                     await bot.send_message(
                                         user_id,
-                                        f"⚠️ Network/RPC error - will retry\n\n"
+                                        f"⚠️ Network/RPC error - execution blocked\n\n"
                                         f"🆔 Order: {order_id}\n"
                                         f"Error: {error_str[:200]}\n\n"
-                                        f"Will retry automatically on next scheduler tick."
+                                        f"Will retry when next DCA interval is reached ({interval_hours}h).\n"
+                                        f"Or use /execute to retry manually."
                                     )
                                     # DO NOT advance schedule - will retry
                                     continue
@@ -785,7 +796,7 @@ async def dca_scheduler():
                                     ['timeout', 'connection', 'rpc', '5xx', 'unavailable', 'failed to connect'])
                                 
                                 if is_retryable:
-                                    # Mark as blocked - will retry
+                                    # Mark as blocked - will retry when DCA interval reached
                                     await db.execute(
                                         "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
                                         (error_msg[:500], order_id, plan_id)
@@ -794,10 +805,11 @@ async def dca_scheduler():
                                     
                                     await bot.send_message(
                                         user_id,
-                                        f"⚠️ Network/RPC error - will retry\n\n"
+                                        f"⚠️ Network/RPC error - execution blocked\n\n"
                                         f"🆔 Order: {order_id}\n"
                                         f"Error: {error_msg[:200]}\n\n"
-                                        f"Will retry automatically."
+                                        f"Will retry when next DCA interval is reached ({interval_hours}h).\n"
+                                        f"Or use /execute to retry manually."
                                     )
                                     # DO NOT advance schedule
                                     continue
