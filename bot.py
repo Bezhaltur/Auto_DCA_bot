@@ -532,9 +532,36 @@ async def dca_scheduler():
                         if order_check:
                             existing_order_id, existing_order_expires = order_check
                             if existing_order_id and existing_order_expires and existing_order_expires > now:
-                                # Уже есть активный ордер - пропускаем
-                                logger.info(f"Пропуск DCA для plan_id={plan_id}: уже есть активный ордер {existing_order_id}")
-                                continue
+                                # Check if this order is blocked (can retry) or still in progress
+                                async with db.execute(
+                                    "SELECT state FROM sent_transactions WHERE order_id = ? AND plan_id = ?",
+                                    (existing_order_id, plan_id)
+                                ) as state_cur:
+                                    state_row = await state_cur.fetchone()
+                                
+                                if state_row:
+                                    existing_state = state_row[0]
+                                    if existing_state == 'sent':
+                                        # Order completed successfully - should not happen with active order
+                                        logger.warning(f"Active order {existing_order_id} already sent, clearing active order")
+                                    elif existing_state == 'sending':
+                                        # Order still being sent - wait
+                                        logger.info(f"Skip DCA plan_id={plan_id}: order {existing_order_id} still sending")
+                                        continue
+                                    elif existing_state == 'blocked':
+                                        # Blocked order - can retry by creating new order
+                                        logger.info(f"Retry DCA plan_id={plan_id}: previous order {existing_order_id} was blocked")
+                                        # Fall through to create new order
+                                    elif existing_state == 'failed':
+                                        # Failed order - already advanced schedule, shouldn't be here
+                                        logger.warning(f"Active order {existing_order_id} failed, clearing active order")
+                                else:
+                                    # No transaction record yet - order exists but not attempted
+                                    logger.info(f"Skip DCA plan_id={plan_id}: active order {existing_order_id} not yet attempted")
+                                    continue
+                            else:
+                                # Order expired - can create new order
+                                logger.info(f"Active order {existing_order_id} expired, creating new order for plan_id={plan_id}")
                         
                         logger.info(f"Выполнение DCA для plan_id={plan_id}, user_id={user_id}: {amount} {from_asset}")
                         
@@ -633,22 +660,6 @@ async def dca_scheduler():
                                 required_amount = float(deposit_amount)
                             except:
                                 required_amount = amount  # Fallback to plan amount
-                            
-                            # Check if we already have a transaction record for this order (idempotency)
-                            async with db.execute(
-                                "SELECT state, transfer_tx_hash FROM sent_transactions WHERE order_id = ? AND plan_id = ?",
-                                (order_id, plan_id)
-                            ) as cur:
-                                existing_tx = await cur.fetchone()
-                            
-                            if existing_tx:
-                                existing_state, existing_tx_hash = existing_tx
-                                # If already sent, sending, or blocked, skip to prevent duplicate
-                                if existing_state in ('sending', 'sent', 'blocked'):
-                                    logger.warning(f"Order {order_id} already in state {existing_state}, skipping duplicate execution")
-                                    # DO NOT advance schedule for blocked or sending states
-                                    # Only continue to next plan
-                                    continue
                             
                             # Create transaction record in 'sending' state BEFORE attempting send
                             await db.execute(

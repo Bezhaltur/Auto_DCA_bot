@@ -102,10 +102,17 @@ scheduled → sending → sent (success, advance schedule)
 - Next DCA interval will trigger retry attempt
 
 **What happens on next scheduler tick:**
-- If `next_run <= now`, scheduler will attempt execution
-- Idempotency check sees existing state = 'blocked'
-- Skips duplicate execution without advancing schedule
-- Waits for next interval
+- If `next_run <= now`, scheduler attempts execution
+- Checks active_order_id for the plan
+- If order is blocked: creates NEW order (automatic retry)
+- If order is sending: waits (order in progress)
+- If order expired: creates NEW order (normal execution)
+- Blocked orders are retried automatically, no infinite loop
+
+**What happens on restart:**
+- Blocked transactions remain blocked (not reset)
+- Password loaded from keyring
+- Next scheduler tick will retry blocked orders (see above)
 
 ## Testing
 

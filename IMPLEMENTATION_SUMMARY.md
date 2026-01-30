@@ -168,18 +168,24 @@ if existing_state in ('sending', 'sent', 'blocked'):
 ```
 
 ### Blocked State Semantics (CORRECTED):
-- `state = 'blocked'` means execution NOT completed
+- `state = 'blocked'` means execution NOT completed due to RPC/network error
 - Blocked executions DO NOT advance DCA schedule
 - Blocked executions are NOT auto-reset on startup
-- On next scheduler tick, blocked orders remain blocked until RPC is available
-- User can manually retry via `/execute` or wait for next DCA interval
+- On next scheduler tick:
+  - Checks active_order_id for the plan
+  - If order is blocked: creates NEW order (retry)
+  - If order is sending: waits
+  - If order is expired: creates NEW order
+- Blocked orders are retried automatically when next_run <= now
 
 ### Hard Rules (NON-NEGOTIABLE):
-- ✅ If state ∈ {sending, sent, blocked} → NEVER resend
+- ✅ If state = 'sending' → Wait (do not create new order)
+- ✅ If state = 'sent' → Execution complete, schedule advanced
+- ✅ If state = 'blocked' → Retry by creating new order
+- ✅ If state = 'failed' → Schedule advanced, plan moved to next interval
 - ✅ Purchase executed ONLY when tx_hash exists
 - ✅ Restart MUST NOT cause duplicates
 - ✅ Schedule advances ONLY when state → 'sent' or 'failed'
-- ✅ Blocked state does NOT advance schedule
 
 ---
 
