@@ -463,6 +463,16 @@ async def init_db():
             )
         ''')
         
+        # Migrate sent_transactions table to add state and error_message columns if missing
+        async with db.execute("PRAGMA table_info(sent_transactions)") as cursor:
+            columns = await cursor.fetchall()
+            existing_columns = [col[1] for col in columns]
+        
+        if "state" not in existing_columns:
+            await db.execute("ALTER TABLE sent_transactions ADD COLUMN state TEXT DEFAULT 'scheduled'")
+        if "error_message" not in existing_columns:
+            await db.execute("ALTER TABLE sent_transactions ADD COLUMN error_message TEXT")
+        
         # Создаём таблицу для отслеживания завершённых ордеров
         await db.execute('''
             CREATE TABLE IF NOT EXISTS completed_orders (
@@ -624,45 +634,122 @@ async def dca_scheduler():
                             except:
                                 required_amount = amount  # Fallback to plan amount
                             
+                            # Check if we already have a transaction record for this order (idempotency)
+                            async with db.execute(
+                                "SELECT state, transfer_tx_hash FROM sent_transactions WHERE order_id = ? AND plan_id = ?",
+                                (order_id, plan_id)
+                            ) as cur:
+                                existing_tx = await cur.fetchone()
+                            
+                            if existing_tx:
+                                existing_state, existing_tx_hash = existing_tx
+                                # If already sent or sending, skip to prevent duplicate
+                                if existing_state in ('sending', 'sent'):
+                                    logger.warning(f"Order {order_id} already in state {existing_state}, skipping duplicate execution")
+                                    # Advance schedule
+                                    new_next_run = now + (interval_hours * 3600)
+                                    await db.execute(
+                                        "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                        (new_next_run, plan_id)
+                                    )
+                                    await db.commit()
+                                    continue
+                            
+                            # Create transaction record in 'sending' state BEFORE attempting send
+                            await db.execute(
+                                "INSERT INTO sent_transactions (user_id, plan_id, order_id, network_key, amount, deposit_address, state) VALUES (?, ?, ?, ?, ?, ?, 'sending')",
+                                (user_id, plan_id, order_id, from_asset, required_amount, deposit_address)
+                            )
+                            await db.commit()
+                            
                             await bot.send_message(
                                 user_id,
-                                f"✅ DCA план выполнен!\n\n"
-                                f"🆔 Ордер: {order_id}\n"
-                                f"🔗 Ссылка: {order_url}\n\n"
-                                f"⏳ Автоматически отправляю USDT..."
+                                f"✅ DCA plan executed!\n\n"
+                                f"🆔 Order: {order_id}\n"
+                                f"🔗 Link: {order_url}\n\n"
+                                f"⏳ Auto-sending USDT..."
                             )
                             
                             # Автоматическая отправка USDT
-                            success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
-                                network_key=from_asset,
-                                user_id=user_id,
-                                wallet_password=wallet_password,
-                                deposit_address=deposit_address,
-                                required_amount=required_amount,
-                                btc_address=btc_address,
-                                order_id=order_id,
-                                dry_run=DRY_RUN
-                            )
+                            try:
+                                success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
+                                    network_key=from_asset,
+                                    user_id=user_id,
+                                    wallet_password=wallet_password,
+                                    deposit_address=deposit_address,
+                                    required_amount=required_amount,
+                                    btc_address=btc_address,
+                                    order_id=order_id,
+                                    dry_run=DRY_RUN
+                                )
+                            except Exception as send_error:
+                                # RPC/Network error - mark as blocked, don't advance schedule
+                                error_str = str(send_error)
+                                logger.error(f"RPC/Network error during auto-send: {error_str}")
+                                
+                                # Check if it's a retryable error (RPC, timeout, connection)
+                                is_retryable = any(keyword in error_str.lower() for keyword in 
+                                    ['timeout', 'connection', 'rpc', '5xx', 'unavailable', 'failed to connect'])
+                                
+                                if is_retryable:
+                                    # Mark as blocked - will retry on next tick
+                                    await db.execute(
+                                        "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
+                                        (error_str[:500], order_id, plan_id)
+                                    )
+                                    await db.commit()
+                                    
+                                    await bot.send_message(
+                                        user_id,
+                                        f"⚠️ Network/RPC error - will retry\n\n"
+                                        f"🆔 Order: {order_id}\n"
+                                        f"Error: {error_str[:200]}\n\n"
+                                        f"Will retry automatically on next scheduler tick."
+                                    )
+                                    # DO NOT advance schedule - will retry
+                                    continue
+                                else:
+                                    # Non-retryable error - mark as failed, advance schedule
+                                    await db.execute(
+                                        "UPDATE sent_transactions SET state = 'failed', error_message = ? WHERE order_id = ? AND plan_id = ?",
+                                        (error_str[:500], order_id, plan_id)
+                                    )
+                                    await db.commit()
+                                    
+                                    await bot.send_message(
+                                        user_id,
+                                        f"❌ Auto-send failed\n\n"
+                                        f"🆔 Order: {order_id}\n"
+                                        f"Error: {error_str[:200]}\n\n"
+                                        f"Please send manually."
+                                    )
+                                    # Advance schedule for failed transactions
+                                    new_next_run = now + (interval_hours * 3600)
+                                    await db.execute(
+                                        "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                        (new_next_run, plan_id)
+                                    )
+                                    await db.commit()
+                                    continue
                             
                             if success:
-                                # Сохраняем информацию о транзакции
+                                # Update transaction record with hashes and 'sent' state
                                 config = get_network_config(from_asset)
-                                async with db.execute(
-                                    "INSERT INTO sent_transactions (user_id, plan_id, order_id, network_key, approve_tx_hash, transfer_tx_hash, amount, deposit_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (user_id, plan_id, order_id, from_asset, approve_tx, transfer_tx, required_amount, deposit_address)
-                                ):
-                                    pass
+                                await db.execute(
+                                    "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'sent' WHERE order_id = ? AND plan_id = ?",
+                                    (approve_tx, transfer_tx, order_id, plan_id)
+                                )
                                 await db.commit()
                                 
                                 explorer_base = config["explorer_base"]
                                 transfer_url = f"{explorer_base}{transfer_tx}" if transfer_tx else None
                                 
                                 msg = (
-                                    f"✅ USDT отправлен автоматически!\n\n"
-                                    f"🆔 Ордер: {order_id}\n"
-                                    f"🔗 Ссылка: {order_url}\n\n"
-                                    f"💵 Отправлено: {required_amount:.6f} USDT\n"
-                                    f"📍 На адрес: {deposit_address[:10]}...{deposit_address[-6:]}\n\n"
+                                    f"✅ USDT sent automatically!\n\n"
+                                    f"🆔 Order: {order_id}\n"
+                                    f"🔗 Link: {order_url}\n\n"
+                                    f"💵 Sent: {required_amount:.6f} USDT\n"
+                                    f"📍 To: {deposit_address[:10]}...{deposit_address[-6:]}\n\n"
                                 )
                                 
                                 if approve_tx:
@@ -673,38 +760,65 @@ async def dca_scheduler():
                                     msg += f"✅ Transfer: {transfer_url}\n"
                                 
                                 if DRY_RUN:
-                                    msg += f"\n⚠️ DRY RUN MODE - транзакции не были отправлены"
+                                    msg += f"\n⚠️ DRY RUN MODE - transactions not broadcast"
                                 
                                 await bot.send_message(user_id, msg)
                                 
                                 logger.info(f"Auto-send successful: order_id={order_id}, approve_tx={approve_tx}, transfer_tx={transfer_tx}")
                             else:
-                                # Ошибка автоматической отправки - уведомляем пользователя
-                                error_notification = (
-                                    f"❌ Не удалось автоматически отправить USDT\n\n"
-                                    f"🆔 Ордер: {order_id}\n"
-                                    f"🔗 Ссылка: {order_url}\n\n"
-                                    f"Ошибка: {error_msg}\n\n"
-                                    f"💵 Требуется отправить вручную:\n"
-                                    f"{required_amount:.6f} USDT\n"
-                                    f"📍 На адрес:\n{deposit_address}\n\n"
-                                    f"⏰ Ордер действителен: {time_text}"
-                                )
-                                await bot.send_message(user_id, error_notification)
-                                logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
+                                # Check if error is retryable
+                                is_retryable = any(keyword in error_msg.lower() for keyword in 
+                                    ['timeout', 'connection', 'rpc', '5xx', 'unavailable', 'failed to connect'])
+                                
+                                if is_retryable:
+                                    # Mark as blocked - will retry
+                                    await db.execute(
+                                        "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
+                                        (error_msg[:500], order_id, plan_id)
+                                    )
+                                    await db.commit()
+                                    
+                                    await bot.send_message(
+                                        user_id,
+                                        f"⚠️ Network/RPC error - will retry\n\n"
+                                        f"🆔 Order: {order_id}\n"
+                                        f"Error: {error_msg[:200]}\n\n"
+                                        f"Will retry automatically."
+                                    )
+                                    # DO NOT advance schedule
+                                    continue
+                                else:
+                                    # Non-retryable error - mark as failed
+                                    await db.execute(
+                                        "UPDATE sent_transactions SET state = 'failed', error_message = ? WHERE order_id = ? AND plan_id = ?",
+                                        (error_msg[:500], order_id, plan_id)
+                                    )
+                                    await db.commit()
+                                    
+                                    error_notification = (
+                                        f"❌ Failed to auto-send USDT\n\n"
+                                        f"🆔 Order: {order_id}\n"
+                                        f"🔗 Link: {order_url}\n\n"
+                                        f"Error: {error_msg}\n\n"
+                                        f"💵 Please send manually:\n"
+                                        f"{required_amount:.6f} USDT\n"
+                                        f"📍 To:\n{deposit_address}\n\n"
+                                        f"⏰ Order valid for: {time_text}"
+                                    )
+                                    await bot.send_message(user_id, error_notification)
+                                    logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
                         else:
-                            # Кошелёк не настроен - просим отправить вручную
+                            # Wallet not configured - ask to send manually
                             await bot.send_message(
                                 user_id,
-                                f"✅ DCA план выполнен!\n\n"
-                                f"🆔 Ордер: {order_id}\n"
-                                f"🔗 Ссылка: {order_url}\n\n"
-                                f"💵 Отправь: {deposit_amount} {deposit_code}\n"
-                                f"📍 Адрес депозита:\n{deposit_address}\n\n"
-                                f"⏰ Ордер действителен: {time_text}\n\n"
-                                f"💡 Для автоматической отправки:\n"
-                                f"1. Настрой кошелёк: /setwallet\n"
-                                f"2. Установи пароль: /setpassword"
+                                f"✅ DCA plan executed!\n\n"
+                                f"🆔 Order: {order_id}\n"
+                                f"🔗 Link: {order_url}\n\n"
+                                f"💵 Send: {deposit_amount} {deposit_code}\n"
+                                f"📍 Deposit address:\n{deposit_address}\n\n"
+                                f"⏰ Order valid for: {time_text}\n\n"
+                                f"💡 For auto-send, setup wallet:\n"
+                                f"/setwallet"
                             )
                         
                         # Обновляем время следующего запуска ТОЛЬКО для этого конкретного плана
@@ -2199,6 +2313,34 @@ async def load_passwords_at_startup():
             logger.warning(f"No password in keyring for user {user_id}")
 
 
+async def recover_blocked_transactions():
+    """
+    Recover blocked transactions on startup (restart safety).
+    Reset blocked transactions to scheduled state so they can be retried.
+    """
+    logger.info("Recovering blocked transactions...")
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Find all blocked transactions
+        async with db.execute(
+            "SELECT order_id, plan_id, user_id FROM sent_transactions WHERE state = 'blocked'"
+        ) as cursor:
+            blocked_txs = await cursor.fetchall()
+        
+        if blocked_txs:
+            logger.info(f"Found {len(blocked_txs)} blocked transactions to recover")
+            for order_id, plan_id, user_id in blocked_txs:
+                # Reset to scheduled state so they can be retried
+                await db.execute(
+                    "UPDATE sent_transactions SET state = 'scheduled', error_message = NULL WHERE order_id = ? AND plan_id = ?",
+                    (order_id, plan_id)
+                )
+                logger.info(f"Reset blocked transaction: order_id={order_id}, plan_id={plan_id}, user_id={user_id}")
+            await db.commit()
+        else:
+            logger.info("No blocked transactions to recover")
+
+
 async def main():
     """
     Главная функция запуска бота.
@@ -2223,6 +2365,9 @@ async def main():
     
     # Load passwords from keyring into memory cache
     await load_passwords_at_startup()
+    
+    # Recover blocked transactions on startup (restart safety)
+    await recover_blocked_transactions()
     
     # Обновление актуальных кодов сетей из FixedFloat
     await update_network_codes()
