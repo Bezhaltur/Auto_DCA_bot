@@ -643,16 +643,11 @@ async def dca_scheduler():
                             
                             if existing_tx:
                                 existing_state, existing_tx_hash = existing_tx
-                                # If already sent or sending, skip to prevent duplicate
-                                if existing_state in ('sending', 'sent'):
+                                # If already sent, sending, or blocked, skip to prevent duplicate
+                                if existing_state in ('sending', 'sent', 'blocked'):
                                     logger.warning(f"Order {order_id} already in state {existing_state}, skipping duplicate execution")
-                                    # Advance schedule
-                                    new_next_run = now + (interval_hours * 3600)
-                                    await db.execute(
-                                        "UPDATE dca_plans SET next_run = ? WHERE id = ?",
-                                        (new_next_run, plan_id)
-                                    )
-                                    await db.commit()
+                                    # DO NOT advance schedule for blocked or sending states
+                                    # Only continue to next plan
                                     continue
                             
                             # Create transaction record in 'sending' state BEFORE attempting send
@@ -765,6 +760,14 @@ async def dca_scheduler():
                                 await bot.send_message(user_id, msg)
                                 
                                 logger.info(f"Auto-send successful: order_id={order_id}, approve_tx={approve_tx}, transfer_tx={transfer_tx}")
+                                
+                                # Advance schedule ONLY on successful send
+                                new_next_run = now + (interval_hours * 3600)
+                                await db.execute(
+                                    "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                    (new_next_run, plan_id)
+                                )
+                                await db.commit()
                             else:
                                 # Check if error is retryable
                                 is_retryable = any(keyword in error_msg.lower() for keyword in 
@@ -807,6 +810,14 @@ async def dca_scheduler():
                                     )
                                     await bot.send_message(user_id, error_notification)
                                     logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
+                                    
+                                    # Advance schedule ONLY for failed (non-retryable) errors
+                                    new_next_run = now + (interval_hours * 3600)
+                                    await db.execute(
+                                        "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                        (new_next_run, plan_id)
+                                    )
+                                    await db.commit()
                         else:
                             # Wallet not configured - ask to send manually
                             await bot.send_message(
@@ -820,16 +831,15 @@ async def dca_scheduler():
                                 f"💡 For auto-send, setup wallet:\n"
                                 f"/setwallet"
                             )
+                            # Advance schedule for manual send case (order created, user notified)
+                            new_next_run = now + (interval_hours * 3600)
+                            await db.execute(
+                                "UPDATE dca_plans SET next_run = ? WHERE id = ?",
+                                (new_next_run, plan_id)
+                            )
+                            await db.commit()
                         
-                        # Обновляем время следующего запуска ТОЛЬКО для этого конкретного плана
-                        new_next_run = now + (interval_hours * 3600)
-                        await db.execute(
-                            "UPDATE dca_plans SET next_run = ? WHERE id = ?",
-                            (new_next_run, plan_id)
-                        )
-                        await db.commit()
-                        
-                        logger.info(f"DCA выполнен успешно для plan_id={plan_id}, user_id={user_id}, order_id={order_id}")
+                        logger.info(f"DCA execution completed for plan_id={plan_id}, user_id={user_id}, order_id={order_id}")
                         
                     except Exception as e:
                         logger.error(f"Ошибка выполнения DCA для plan_id={plan_id}, user_id={user_id}: {e}")
@@ -2313,32 +2323,7 @@ async def load_passwords_at_startup():
             logger.warning(f"No password in keyring for user {user_id}")
 
 
-async def recover_blocked_transactions():
-    """
-    Recover blocked transactions on startup (restart safety).
-    Reset blocked transactions to scheduled state so they can be retried.
-    """
-    logger.info("Recovering blocked transactions...")
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Find all blocked transactions
-        async with db.execute(
-            "SELECT order_id, plan_id, user_id FROM sent_transactions WHERE state = 'blocked'"
-        ) as cursor:
-            blocked_txs = await cursor.fetchall()
-        
-        if blocked_txs:
-            logger.info(f"Found {len(blocked_txs)} blocked transactions to recover")
-            for order_id, plan_id, user_id in blocked_txs:
-                # Reset to scheduled state so they can be retried
-                await db.execute(
-                    "UPDATE sent_transactions SET state = 'scheduled', error_message = NULL WHERE order_id = ? AND plan_id = ?",
-                    (order_id, plan_id)
-                )
-                logger.info(f"Reset blocked transaction: order_id={order_id}, plan_id={plan_id}, user_id={user_id}")
-            await db.commit()
-        else:
-            logger.info("No blocked transactions to recover")
+
 
 
 async def main():
@@ -2365,9 +2350,6 @@ async def main():
     
     # Load passwords from keyring into memory cache
     await load_passwords_at_startup()
-    
-    # Recover blocked transactions on startup (restart safety)
-    await recover_blocked_transactions()
     
     # Обновление актуальных кодов сетей из FixedFloat
     await update_network_codes()

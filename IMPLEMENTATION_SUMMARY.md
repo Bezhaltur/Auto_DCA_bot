@@ -160,32 +160,26 @@ existing_tx = await db.execute(
     (order_id, plan_id)
 )
 
-if existing_state in ('sending', 'sent'):
-    # NEVER resend - advance schedule and continue
+if existing_state in ('sending', 'sent', 'blocked'):
+    # NEVER resend
     logger.warning(f"Order already in state {existing_state}, skipping")
+    # DO NOT advance schedule for blocked or sending states
     continue
 ```
 
-### State Recovery on Startup:
-```python
-async def recover_blocked_transactions():
-    # Reset blocked transactions to scheduled
-    # Allows retry after RPC/network issues
-    blocked_txs = await db.execute(
-        "SELECT order_id FROM sent_transactions WHERE state = 'blocked'"
-    )
-    for order_id in blocked_txs:
-        await db.execute(
-            "UPDATE sent_transactions SET state = 'scheduled' WHERE order_id = ?",
-            (order_id,)
-        )
-```
+### Blocked State Semantics (CORRECTED):
+- `state = 'blocked'` means execution NOT completed
+- Blocked executions DO NOT advance DCA schedule
+- Blocked executions are NOT auto-reset on startup
+- On next scheduler tick, blocked orders remain blocked until RPC is available
+- User can manually retry via `/execute` or wait for next DCA interval
 
 ### Hard Rules (NON-NEGOTIABLE):
-- ✅ If state ∈ {sending, sent} → NEVER resend
+- ✅ If state ∈ {sending, sent, blocked} → NEVER resend
 - ✅ Purchase executed ONLY when tx_hash exists
 - ✅ Restart MUST NOT cause duplicates
-- ✅ State recovery on startup is REQUIRED
+- ✅ Schedule advances ONLY when state → 'sent' or 'failed'
+- ✅ Blocked state does NOT advance schedule
 
 ---
 
@@ -461,9 +455,11 @@ python3 -c "import wallet; import bot; print('OK')"
 ✅ **RPC failure handling**
 ✅ **Comprehensive documentation**
 
-**Status**: PRODUCTION READY ✅
+**Status**: UNDER REVIEW - Logic corrections in progress
 
-The bot now operates as a robust, secure, local-only DCA automation tool with enterprise-grade idempotency and restart safety.
+The bot implements a single EVM wallet model with keyring-based password persistence and transaction state management.
+
+**Note**: Blocked state semantics and schedule advancement logic have been corrected to ensure no DCA executions are skipped due to RPC failures.
 
 ---
 
