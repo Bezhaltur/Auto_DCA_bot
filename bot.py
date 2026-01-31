@@ -2026,7 +2026,7 @@ async def cmd_setdca(message: Message):
     Параметры:
     - СЕТЬ: USDT-ARB, USDT-BSC, USDT-MATIC
     - СУММА: 10-500 USD
-    - ИНТЕРВАЛ: 1, 6, 24, 168 (часов)
+    - ИНТЕРВАЛ: 12, 24, 168, 720 (часов)
     - BTC_АДРЕС: валидный Bitcoin адрес
     """
     args = message.text.split()[1:]
