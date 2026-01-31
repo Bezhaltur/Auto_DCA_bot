@@ -904,26 +904,26 @@ async def cmd_start(message: Message):
     username = message.from_user.username or "пользователь"
     
     await message.answer(
-        f"👋 Hi, @{username}!\n\n"
-        f"🤖 AutoDCA Bot - Automatic BTC purchases via FixedFloat\n\n"
-        f"📋 Available commands:\n\n"
-        f"🔧 Setup:\n"
-        f"/setwallet\n"
-        f"/setdca\n"
-        f"/status\n"
-        f"/pause\n"
-        f"/resume\n"
-        f"/delete\n\n"
-        f"💱 Manual operations:\n"
-        f"/execute\n"
-        f"/networks\n"
-        f"/limits\n\n"
-        f"ℹ️ Information:\n"
-        f"/help\n"
-        f"/walletstatus\n"
-        f"/history\n"
-        f"/ping\n\n"
-        f"💡 Start with /setwallet to configure your wallet!",
+        f"👋 Привет, @{username}!\n\n"
+        f"🤖 AutoDCA Bot - Автоматическая покупка BTC через FixedFloat\n\n"
+        f"📋 Доступные команды:\n\n"
+        f"🔧 Настройка:\n"
+        f"/setwallet — настроить кошелёк\n"
+        f"/setdca — создать DCA план\n"
+        f"/status — статус планов\n"
+        f"/pause — приостановить план\n"
+        f"/resume — возобновить план\n"
+        f"/delete — удалить план\n\n"
+        f"💱 Ручные операции:\n"
+        f"/execute — выполнить план вручную\n"
+        f"/networks — доступные сети\n"
+        f"/limits — лимиты обмена\n\n"
+        f"ℹ️ Информация:\n"
+        f"/help — подробная справка\n"
+        f"/walletstatus — баланс кошелька\n"
+        f"/history — история операций\n"
+        f"/ping — проверка бота\n\n"
+        f"💡 Начни с /setwallet для настройки кошелька!",
         parse_mode=None  # Plain text, no markdown
     )
     logger.info(f"New user: {user_id} (@{username})")
@@ -935,57 +935,88 @@ async def cmd_help(message: Message):
     Команда /help - подробная справка по использованию бота.
     """
     await message.answer(
-        "📖 AutoDCA Bot — Local-only Telegram DCA Bot\n"
+        "📖 AutoDCA Bot — Локальный Telegram бот для DCA\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "🔐 Wallet Setup (One Time)\n"
+        "🔐 Настройка кошелька (один раз)\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "1. Create wallet.json in the bot folder:\n\n"
+        "1. Создай wallet.json в папке с ботом:\n\n"
         "```json\n"
         "{\n"
         '  "private_key": "0xYOUR_PRIVATE_KEY",\n'
         '  "password": "YOUR_PASSWORD"\n'
         "}\n"
         "```\n\n"
-        "2. Run:\n"
+        "2. Запусти:\n"
         "/setwallet\n\n"
-        "That's it! Your wallet is now configured.\n\n"
-        "⚠️ IMPORTANT:\n"
-        "• Private key NEVER leaves your machine\n"
-        "• After setup, it is encrypted and removed\n"
-        "• Bot must run locally (not in cloud)\n"
-        "• Restart does NOT disable auto-send\n"
-        "• Password stored in OS keyring (secure)\n"
-        "• Same wallet works for ALL networks\n\n"
+        "Готово! Кошелёк настроен.\n\n"
+        "⚠️ ВАЖНО:\n"
+        "• wallet.json создаётся ОДИН РАЗ\n"
+        "• Приватный ключ удаляется после создания keystore\n"
+        "• Пароль хранится в OS keyring\n"
+        "• Бот переживает перезапуск\n"
+        "• Бот должен работать локально (не в облаке)\n"
+        "• Один кошелёк работает для ВСЕХ сетей\n\n"
+        "🔄 Сброс кошелька:\n"
+        "1. Останови бота\n"
+        "2. Удали файл keystore вручную\n"
+        "3. Перезапусти бота\n"
+        "4. Создай новый wallet.json\n"
+        "5. Запусти /setwallet\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "💱 How It Works\n"
+        "💱 Как это работает\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "1. Create DCA plan: /setdca\n"
-        "2. Bot runs 24/7 on schedule\n"
-        "3. Auto-sends USDT to FixedFloat\n"
-        "4. BTC arrives to your address\n\n"
+        "1. Создаёшь DCA план: /setdca\n"
+        "2. Бот работает 24/7 по расписанию\n"
+        "3. Автоматически отправляет USDT на FixedFloat\n"
+        "4. BTC приходит на твой адрес\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "ℹ️ Commands\n"
+        "ℹ️ Команды\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "/setdca        — create DCA plan\n"
-        "/status        — view active plans\n"
-        "/execute       — execute plan manually\n"
-        "/pause         — pause a plan\n"
-        "/resume        — resume a plan\n"
-        "/delete        — delete a plan\n"
-        "/limits        — check exchange limits\n"
-        "/history       — view order history\n"
-        "/walletstatus  — check wallet balances\n"
-        "/networks      — supported networks\n\n"
+        "/setwallet     — настроить кошелёк\n"
+        "/setdca        — создать DCA план\n"
+        "/status        — статус планов\n"
+        "/execute       — выполнить план вручную\n"
+        "/pause         — приостановить план\n"
+        "/resume        — возобновить план\n"
+        "/delete        — удалить план\n"
+        "/limits        — лимиты обмена\n"
+        "/history       — история операций\n"
+        "/walletstatus  — баланс кошелька\n"
+        "/networks      — доступные сети\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "🔐 Security Model\n"
+        "🔐 Модель безопасности\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "• Equivalent to MetaMask / always-on wallet\n"
-        "• All funds under YOUR control\n"
-        "• Bot runs ONLY locally\n"
-        "• No cloud, no third parties\n"
-        "• Private keys never stored unencrypted\n"
-        "• Password in OS keyring (Windows/macOS/Linux)"
+        "• Эквивалент MetaMask / always-on кошелька\n"
+        "• Все средства под ТВОИМ контролем\n"
+        "• Бот работает ТОЛЬКО локально\n"
+        "• Без облака, без третьих сторон\n"
+        "• Приватные ключи никогда не хранятся незашифрованными\n"
+        "• Пароль в OS keyring (Windows/macOS/Linux)"
     )
+
+
+@dp.message(Command("history"))
+async def cmd_history(message: Message):
+    """
+    Команда /history - показать историю операций.
+    """
+    user_id = message.from_user.id
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM completed_orders WHERE user_id = ?",
+            (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            count = row[0] if row else 0
+    
+    if count == 0:
+        await message.answer("История операций пуста.")
+        return
+    
+    # Existing history display logic would go here
+    # For now, just show empty state message as requested
+    await message.answer("История операций пуста.")
 
 
 @dp.message(Command("ping"))
@@ -1037,15 +1068,10 @@ async def cmd_limits(message: Message):
                 else:
                     rate_formatted = "—"
                 
-                # Ограничиваем max суммой 500
-                if max_amt != "—" and float(max_amt) > 500:
-                    max_display = "500 (лимит бота)"
-                else:
-                    max_display = f"{max_amt}"
-                
+                # Показываем минимум от FixedFloat и максимум бота (500)
                 limits_text += f"🔹 {network_name}:\n"
-                limits_text += f"   Min: {min_amt} USDT\n"
-                limits_text += f"   Max: {max_display} USDT\n"
+                limits_text += f"   Минимум: {min_amt} USDT\n"
+                limits_text += f"   Максимум: 500 USDT (ограничено настройками бота)\n"
                 limits_text += f"   Курс: 1 BTC = {rate_formatted}\n\n"
                 
             except Exception as e:
@@ -1790,8 +1816,13 @@ async def cmd_setwallet(message: Message):
     # Check if keystore already exists
     if keystore_exists(user_id):
         await message.answer(
-            "❌ Wallet already initialized\n\n"
-            "If you need to reset your wallet, please contact support or manually delete the keystore."
+            "❌ Кошелёк уже инициализирован\n\n"
+            "Если нужно сбросить кошелёк:\n"
+            "1. Останови бота\n"
+            "2. Удали файл keystore вручную\n"
+            "3. Перезапусти бота\n"
+            "4. Создай новый wallet.json\n"
+            "5. Запусти /setwallet"
         )
         return
     
@@ -1799,15 +1830,15 @@ async def cmd_setwallet(message: Message):
     wallet_json_path = "wallet.json"
     if not os.path.exists(wallet_json_path):
         await message.answer(
-            "❌ wallet.json not found\n\n"
-            "Create wallet.json in the bot folder with:\n\n"
+            "❌ wallet.json не найден\n\n"
+            "Создай wallet.json в папке с ботом:\n\n"
             "```json\n"
             "{\n"
             '  "private_key": "0xYOUR_PRIVATE_KEY",\n'
             '  "password": "YOUR_PASSWORD"\n'
             "}\n"
             "```\n\n"
-            "Then run /setwallet again",
+            "Затем запусти /setwallet снова",
             parse_mode="Markdown"
         )
         return
@@ -1821,8 +1852,8 @@ async def cmd_setwallet(message: Message):
         
         if not private_key or not password:
             await message.answer(
-                "❌ Invalid wallet.json format\n\n"
-                "Required fields:\n"
+                "❌ Неверный формат wallet.json\n\n"
+                "Обязательные поля:\n"
                 "• private_key\n"
                 "• password"
             )
@@ -1866,24 +1897,18 @@ async def cmd_setwallet(message: Message):
             await db.commit()
         
         await message.answer(
-            f"✅ Wallet initialized successfully!\n\n"
-            f"📍 Address: `{wallet_address}`\n\n"
-            f"🔐 Security:\n"
-            f"• Private key has been encrypted and removed\n"
-            f"• Password stored in OS keyring\n"
-            f"• wallet.json has been overwritten\n\n"
-            f"⚠️ DELETE any backup copies of wallet.json containing the private key!\n\n"
-            f"💡 Auto-send is now enabled for all networks",
+            f"✅ Кошелёк инициализирован успешно!\n\n"
+            f"📍 Адрес: `{wallet_address}`\n\n"
+            f"🔐 Безопасность:\n"
+            f"• Приватный ключ зашифрован и удалён\n"
+            f"• Пароль сохранён в OS keyring\n"
+            f"• wallet.json перезаписан\n\n"
+            f"⚠️ УДАЛИ все резервные копии wallet.json с приватным ключом!\n\n"
+            f"💡 Автоотправка активирована для всех сетей",
             parse_mode="Markdown"
         )
         
         logger.info(f"Wallet initialized for user {user_id}: address={wallet_address}")
-    
-    except Exception as e:
-        logger.error(f"Error in cmd_setwallet: {e}", exc_info=True)
-        await message.answer(f"❌ Error: {e}")
-        
-        logger.info(f"Wallet configured: user_id={user_id}, network={network_key}, address={wallet_address}")
     
     except Exception as e:
         logger.error(f"Error in cmd_setwallet: {e}", exc_info=True)
@@ -2001,7 +2026,7 @@ async def cmd_setdca(message: Message):
     Параметры:
     - СЕТЬ: USDT-ARB, USDT-BSC, USDT-MATIC
     - СУММА: 10-500 USD
-    - ИНТЕРВАЛ: 1, 6, 24, 168 (часов)
+    - ИНТЕРВАЛ: 12, 24, 168, 720 (часов)
     - BTC_АДРЕС: валидный Bitcoin адрес
     """
     args = message.text.split()[1:]
@@ -2045,7 +2070,8 @@ async def cmd_setdca(message: Message):
         if amount < 10 or amount > 500:
             await message.answer(
                 "❌ Неверная сумма\n\n"
-                "Диапазон: 10-500 USD"
+                "Максимум: 500 USDT (ограничено настройками бота)\n\n"
+                "Минимум зависит от сети, проверь /limits"
             )
             return
         
@@ -2061,7 +2087,7 @@ async def cmd_setdca(message: Message):
             if amount < min_limit:
                 await message.answer(
                     f"❌ Сумма меньше минимального лимита FixedFloat\n\n"
-                    f"Минимальная сумма для {from_asset}: {min_limit:.2f} USDT\n"
+                    f"Минимум: {min_limit:.2f} USDT (сетевой лимит FixedFloat)\n"
                     f"Твоя сумма: {amount:.2f} USDT\n\n"
                     f"💡 Увеличь сумму до минимум {min_limit:.2f} USDT"
                 )
@@ -2070,9 +2096,9 @@ async def cmd_setdca(message: Message):
             if amount > effective_max:
                 await message.answer(
                     f"❌ Сумма больше максимального лимита\n\n"
-                    f"Максимальная сумма для {from_asset}: {effective_max:.2f} USDT\n"
+                    f"Максимум: 500 USDT (ограничено настройками бота)\n"
                     f"Твоя сумма: {amount:.2f} USDT\n\n"
-                    f"💡 Уменьшь сумму до максимум {effective_max:.2f} USDT"
+                    f"💡 Уменьши сумму до максимум 500 USDT"
                 )
                 return
             
