@@ -1354,13 +1354,13 @@ async def cmd_execute(message: Message):
             
             # Проверяем есть ли настроенный кошелёк для автоматической отправки
             async with db.execute(
-                "SELECT wallet_address FROM wallets WHERE user_id = ? AND network_key = ?",
-                (user_id, from_asset)
+                "SELECT wallet_address FROM wallets WHERE user_id = ?",
+                (user_id,)
             ) as cur:
                 wallet_row = await cur.fetchone()
             
             # Проверяем есть ли пароль в памяти
-            wallet_password = _wallet_passwords.get((user_id, from_asset))
+            wallet_password = _wallet_passwords.get(user_id)
         
         if wallet_row and wallet_password:
             
